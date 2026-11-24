@@ -532,6 +532,45 @@ impl<'a> CompoundFile<'a> {
         Ok(out)
     }
 
+    /// [`Self::read_capped`] for a damaged file: a stated size larger than the file or than its
+    /// chain, or a chain that breaks off (a bad or missing FAT entry, a sector past the end of a
+    /// truncated file, a loop), gives the bytes read up to that point instead of an error. A
+    /// stream above `cap` is still refused.
+    pub fn read_salvaged(&self, id: usize, cap: u64) -> Result<Vec<u8>> {
+        let e = self.entries.get(id).ok_or_else(|| Error::NotFound(format!("entry {id}")))?;
+        if e.kind != EntryKind::Stream {
+            return Err(invalid(format!("{:?} is not a stream", e.name)));
+        }
+        let cap = cap.min(self.limits.max_stream_size);
+        let size = usize::try_from(e.size.min(self.data.len() as u64)).unwrap_or(0);
+        if size as u64 > cap {
+            return Err(Error::LimitExceeded(format!("stream {:?} is {} bytes, the limit is {cap}", e.name, e.size)));
+        }
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        if e.size < self.mini_cutoff {
+            return self.read_mini_chain(e.start, size);
+        }
+        let mut out = Vec::with_capacity(size);
+        let mut seen = vec![false; self.max_sectors()];
+        let mut s = e.start;
+        while s <= MAXREGSECT && out.len() < size {
+            match seen.get_mut(s as usize) {
+                Some(v) if !*v => *v = true,
+                _ => break,
+            }
+            let Ok(b) = self.sector_tail(s) else { break };
+            out.extend_from_slice(b);
+            if b.len() < self.sector_size {
+                break;
+            }
+            s = self.fat.get(s as usize).copied().unwrap_or(ENDOFCHAIN);
+        }
+        out.truncate(size);
+        Ok(out)
+    }
+
     /// Contents of the stream at `path`.
     pub fn read_path(&self, path: &str) -> Result<Vec<u8>> {
         self.read(self.find(path)?)

@@ -30,6 +30,7 @@ mod notes;
 mod officeart;
 mod piece;
 mod rmark;
+mod recover;
 mod sections;
 mod sprm;
 mod stsh;
@@ -231,8 +232,15 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     if word2::is_word2(bytes) {
         return word2::read(bytes, max_paragraphs);
     }
-    let comp = open_container(bytes)?;
-    let mut word = stream(&comp, "WordDocument")?.ok_or_else(|| DocbinError::NotWord("no WordDocument stream".into()))?;
+    // A damaged compound file (header, FAT or directory) still holds its text: see [`recover`].
+    let comp = match open_container(bytes) {
+        Ok(c) => c,
+        Err(e) => return recover_damaged(bytes, max_paragraphs).unwrap_or(Err(e)),
+    };
+    let mut word = match stream(&comp, "WordDocument")? {
+        Some(w) => w,
+        None => return recover_damaged(bytes, max_paragraphs).unwrap_or_else(|| Err(DocbinError::NotWord("no WordDocument stream".into()))),
+    };
     if word.len() as u64 > MAX_STREAM {
         return Err(DocbinError::Limit(format!("WordDocument stream is {} bytes", word.len())));
     }
@@ -267,9 +275,15 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     let fib = fib::Fib::parse(&word)?;
 
     // The piece table locates every character in the WordDocument stream.
-    let (fc_clx, lcb_clx) =
-        fib.pair(fib::pair::CLX).filter(|(_, lcb)| *lcb > 0).ok_or_else(|| DocbinError::Malformed("the FIB has no piece table (Clx)".into()))?;
-    let pieces = piece::PieceTable::parse(&table, fc_clx, lcb_clx)?;
+    // Without a readable piece table (a lost or damaged Table stream), the text between fcMin and
+    // fcMac is all that is left ([`recover::text_only`]).
+    let pieces = match fib.pair(fib::pair::CLX).filter(|(_, lcb)| *lcb > 0) {
+        Some((fc_clx, lcb_clx)) => match piece::PieceTable::parse(&table, fc_clx, lcb_clx) {
+            Ok(p) => p,
+            Err(e) => return recover::text_only(&word, max_paragraphs).map_err(|_| e),
+        },
+        None => return recover::text_only(&word, max_paragraphs).map_err(|_| DocbinError::Malformed("the FIB has no piece table (Clx)".into())),
+    };
 
     // Styles, fonts and the formatting bin tables; each is optional in broken files.
     let fonts = fib.pair(fib::pair::STTBF_FFN).map(|(f, l)| stsh::fonts(&table, f, l)).unwrap_or_default();
@@ -520,6 +534,17 @@ fn read_word6(comp: Option<&craft_cfb::CompoundFile<'_>>, word: &[u8], max_parag
     doc.ensure_nonempty();
     work.log();
     Ok(doc)
+}
+
+/// A compound file that can't be opened or has lost its WordDocument entry: the WordDocument
+/// stream read on from the first plausible FIB ([`recover::find_fib`]). `None` when there is no
+/// compound file signature or no FIB to be found.
+fn recover_damaged(bytes: &[u8], max_paragraphs: usize) -> Option<Result<Document, DocbinError>> {
+    if !craft_cfb::sniff(bytes) {
+        return None;
+    }
+    let word = bytes.get(recover::find_fib(bytes)?..)?;
+    Some(if word6::is_word6(word) { read_word6(None, word, max_paragraphs) } else { recover::text_only(word, max_paragraphs) })
 }
 
 fn paragraph_limit(max_paragraphs: usize) -> DocbinError {
@@ -1283,7 +1308,19 @@ fn stream(comp: &craft_cfb::CompoundFile<'_>, name: &str) -> Result<Option<Vec<u
     match comp.read_path_capped(name, MAX_STREAM) {
         Ok(v) => Ok(Some(v)),
         Err(craft_cfb::Error::LimitExceeded(e)) => Err(DocbinError::Limit(format!("{name} stream: {e}"))),
-        Err(_) => Ok(None),
+        // A stream the directory tree no longer reaches (a damaged sibling link) is still an
+        // entry of the directory: taken by its name.
+        // A damaged entry or chain gives what it still holds ([`craft_cfb::CompoundFile::read_salvaged`]).
+        Err(_) => {
+            let id = comp.find(name).ok().or_else(|| {
+                comp.entries.iter().position(|e| e.kind == craft_cfb::EntryKind::Stream && e.parent.is_none() && e.name.eq_ignore_ascii_case(name))
+            });
+            match id.map(|id| comp.read_salvaged(id, MAX_STREAM)) {
+                Some(Ok(v)) if !v.is_empty() => Ok(Some(v)),
+                Some(Err(craft_cfb::Error::LimitExceeded(e))) => Err(DocbinError::Limit(format!("{name} stream: {e}"))),
+                _ => Ok(None),
+            }
+        }
     }
 }
 
