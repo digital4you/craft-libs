@@ -276,6 +276,13 @@ fn level_of(l: &RawLvl, lvl_index: usize, fonts: &[String]) -> Level {
     }
     let indent = props.indent_left.unwrap_or(18.0 * (lvl_index as f32 + 1.0)).clamp(0.0, 1000.0);
     let hanging = props.indent_first.map(|f| (-f).clamp(0.0, 1000.0)).unwrap_or(18.0);
+    // The tab stop after the number ("Add tab stop at"): Word stores it as the one stop that
+    // sprmPChgTabsPapx sets in the level's grpprlPapx ([MS-DOC] §2.9.150 LVL.grpprlPapx).
+    let tab = props
+        .tabs
+        .as_ref()
+        .and_then(|t| t.iter().find(|s| s.align != craft_wordmodel::props::TabAlign::Clear))
+        .map(|s| s.pos.clamp(0.0, 1584.0));
     let mut chr = CharProps::default();
     let base = chr.clone();
     for prl in sprm::iter(&l.chpx) {
@@ -303,6 +310,7 @@ fn level_of(l: &RawLvl, lvl_index: usize, fonts: &[String]) -> Level {
         restart: l.flags & 0x08 == 0,
         legal: l.flags & 0x04 != 0,
         style: None,
+        tab,
         ..Level::default()
     }
 }
