@@ -316,16 +316,23 @@ fn read_opened_in(pkg: &Package, chunks: ChunkState) -> Result<(Document, usize,
             });
         }
     }
-    if let Some(body) = root.child("w:body") {
+    // One body per document; a file with more (some generators append one per chunk) has the
+    // later bodies' content follow the first's, and the first final section properties found.
+    let mut bodies = root.children("w:body").peekable();
+    if bodies.peek().is_some() {
         let mut sc = StoryCtx::default();
         let mut blocks = Blocks::new();
-        r.read_blocks(&mut sc, body, &rels, &mut blocks, r.chunks.depth);
+        let mut last_section = None;
+        for body in bodies {
+            r.read_blocks(&mut sc, body, &rels, &mut blocks, r.chunks.depth);
+            last_section = last_section.or_else(|| body.child("w:sectPr"));
+        }
         r.flush_pending(&mut sc, &mut blocks);
         r.doc.body = blocks;
         unstyle_toc_links(&mut r.doc);
         toc_control_to_toc(&mut r.doc.body);
         toc_field_to_heading(&mut r.doc.body);
-        if let Some(s) = body.child("w:sectPr") {
+        if let Some(s) = last_section {
             r.doc.last_section = r.read_section(s, &rels);
         }
     }
