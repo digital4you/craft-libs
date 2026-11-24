@@ -529,7 +529,9 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
         }
         P_OUTLVL => {
             if let Some(&l) = prl.operand.first() {
-                p.outline_level = Some(l.min(8));
+                // 0–8 are the outline levels 1–9, 9 is body text ([MS-DOC] sprmPOutLvl), which a
+                // style based on a heading uses to stay out of the outline.
+                p.outline_level = Some(l.min(9));
             }
         }
         P_BRC_TOP80 | P_BRC_LEFT80 | P_BRC_BOTTOM80 | P_BRC_RIGHT80 | P_BRC_BETWEEN80 => {
