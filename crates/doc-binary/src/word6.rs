@@ -7,8 +7,8 @@
 //!
 //! What is read: the main text, its paragraphs and fields, the code page of each run, the
 //! character and paragraph formatting listed below, table rows, and the paragraph styles (with
-//! their formatting). Character styles, sections, headers and footers, notes, pictures, borders,
-//! shading and tabs are not read yet.
+//! their formatting). Paragraph borders and shading, cell shading and paragraph spacing are
+//! read too. Character styles, headers and footers, notes, pictures and tabs are not read yet.
 //!
 //! The layout as observed:
 //!
@@ -143,6 +143,18 @@ mod pap {
     /// descriptor per cell whose first word's bit 0 starts a horizontal merge and bit 1 continues
     /// it.
     pub(super) const DEF_TABLE: u8 = 0xBE;
+    /// Paragraph borders, a 2-byte Word 6.0 BRC each: top, left, bottom, right, between
+    /// (Word 97's sprmPBrcTop80..sprmPBrcBetween80, in the same order).
+    pub(super) const BRC_TOP: u8 = 0x26;
+    pub(super) const BRC_BETWEEN: u8 = 0x2A;
+    /// Space before and after the paragraph in twips (2 bytes; Word 97's sprmPDyaBefore and
+    /// sprmPDyaAfter).
+    pub(super) const BEFORE: u8 = 0x15;
+    pub(super) const AFTER: u8 = 0x16;
+    /// Paragraph shading, a 2-byte `Shd80` as in Word 97 (sprmPShd80).
+    pub(super) const SHD: u8 = 0x2F;
+    /// Cell shading: a `Shd80` per cell, as Word 97's sprmTDefTableShd80.
+    pub(super) const DEF_TABLE_SHD: u8 = 0xBF;
 }
 
 /// Word 97 opcodes the translations produce ([MS-DOC] §2.6).
@@ -167,6 +179,11 @@ mod w97 {
     pub(super) const T_ROW_HEIGHT: u16 = 0x9407;
     pub(super) const T_DEF_TABLE: u16 = 0xD608;
     pub(super) const T_MERGE: u16 = 0x5624;
+    pub(super) const P_BRC_TOP80: u16 = 0x6424;
+    pub(super) const P_SHD80: u16 = 0x442D;
+    pub(super) const P_DYA_BEFORE: u16 = 0xA413;
+    pub(super) const P_DYA_AFTER: u16 = 0xA414;
+    pub(super) const T_DEF_TABLE_SHD80: u16 = 0xD609;
 }
 
 /// Is this WordDocument stream a Word 6.0/95 one?
@@ -662,7 +679,7 @@ fn sprms(grpprl: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
             0x05 | 0x08 | 0x0D | 0x0E | 0x18 | 0x19 | 0x1D | 0x25 | 0x2C | 0x33 | 0x55..=0x5C | 0x5E | 0x62 | 0x68 | 0x75 | 0xB7 | 0xB9 => 1,
             // 0x1A/0x1B: a frame's position; 0x6B: kerning in half-points (H1 has 0x0024; Word
             // shows kern=36).
-            0x10 | 0x11 | 0x13 | 0x15 | 0x16 | 0x1A | 0x1B | 0x26 | 0x27 | 0x28 | 0x29 | 0x2F | 0x50 | 0x5D | 0x60 | 0x61 | 0x63 | 0x6B | 0xB6
+            0x10 | 0x11 | 0x13 | 0x15 | 0x16 | 0x1A | 0x1B | 0x26 | 0x27 | 0x28 | 0x29 | 0x2A | 0x2F | 0x50 | 0x5D | 0x60 | 0x61 | 0x63 | 0x6B | 0xB6
             | 0xB8 | 0xBD | 0xC0 => 2,
             0x14 => 4,
             // A count byte, then that many bytes (0x0C: a bulleted style's numbering, 52 bytes).
@@ -806,10 +823,36 @@ fn translate_pap(grpprl: &[u8]) -> Vec<u8> {
             pap::ROW_JC => prl(&mut out, w97::T_JC, v),
             pap::ROW_HEIGHT => prl(&mut out, w97::T_ROW_HEIGHT, v),
             pap::DEF_TABLE => def_table(&mut out, v),
+            pap::BRC_TOP..=pap::BRC_BETWEEN => {
+                if let [b0, b1, ..] = v {
+                    prl(&mut out, w97::P_BRC_TOP80 + u16::from(op - pap::BRC_TOP), &brc80(u16::from_le_bytes([*b0, *b1])));
+                }
+            }
+            pap::BEFORE => prl(&mut out, w97::P_DYA_BEFORE, v),
+            pap::AFTER => prl(&mut out, w97::P_DYA_AFTER, v),
+            pap::SHD if v.len() == 2 => prl(&mut out, w97::P_SHD80, v),
+            pap::DEF_TABLE_SHD => prl(&mut out, w97::T_DEF_TABLE_SHD80, v),
             _ => {}
         }
     }
     out
+}
+
+/// A Word 6.0/95 BRC (2 bytes: line width in 0.75 pt steps, 6 dotted, 7 dashed; 2 bits of
+/// type; shadow; ico; space in points) as a Word 97 `Brc80` ([MS-DOC] Brc80). 0 is no border.
+/// The layout follows docboss (docboss-doc word6.rs brc80).
+fn brc80(brc: u16) -> [u8; 4] {
+    if brc == 0 {
+        return [0; 4];
+    }
+    let (width, kind) = match brc & 7 {
+        6 => (6, 6),
+        7 => (6, 7),
+        w => ((w as u8).max(1) * 6, ((brc >> 3) & 3) as u8),
+    };
+    let ico = ((brc >> 6) & 0x1F) as u8;
+    let tail = ((brc >> 11) & 0x1F) as u8 | (((brc >> 5) & 1) as u8) << 5;
+    [width, kind, ico, tail]
 }
 
 /// A Word 6.0/95 table definition as a Word 97 `sprmTDefTable` holding the cell edges (the only
