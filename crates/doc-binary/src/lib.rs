@@ -676,6 +676,11 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
     // Field assembly state: instruction characters are swallowed, the result is kept until
     // the end character, then emitted as one object (hyperlinks keep their result text).
     let mut field: Option<FieldBuild> = None;
+    // Fields whose result reaches over a paragraph mark or holds a field of its own (a table of
+    // contents, an index) are written as range fields: a `FieldStart` was emitted and their
+    // result is walked as ordinary text, up to the `FieldEnd` their end character adds. These
+    // are the ones still open, outermost first; each keeps whether it is a hyperlink's target.
+    let mut ranges: Vec<Option<String>> = Vec::new();
     let mut fmt = FmtState::default();
     while cp < cp_end {
         // Bookmark boundaries at this CP (main-document walks only; subdocument walks get
@@ -711,6 +716,14 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
             '\r' | '\u{7}' | '\u{C}' if c != '\u{C}' || section_mark => {
                 if !ctx.paragraphs.spend() {
                     break;
+                }
+                // A field result that goes on past this mark becomes a range field, so its
+                // paragraphs stay paragraphs ([MS-DOC] §2.8.25: a field's result may hold any
+                // content, paragraph marks included).
+                if field.as_ref().is_some_and(|f| f.depth == 1 && f.sep.is_some())
+                    && let Some(f) = field.take()
+                {
+                    ranges.push(open_range(&mut pb, f, ctx.work));
                 }
                 // Paragraph mark: its PAPX covers the FC range of the paragraph it ends, so
                 // querying at the mark's own FC finds that paragraph's properties.
@@ -759,6 +772,7 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                 if let Some(num) = num_of(ilfo) {
                     pb.props.numbering = Some(NumRef { num, level: ilvl });
                 }
+                fmt::settle_frame(&mut pb.props);
                 let fc = ctx.pieces.fc_of_cp(cp).unwrap_or(0);
                 let chpx = ctx.chpx_bins.chpx(ctx.word, fc);
                 pb.mark = char_props(chpx, ctx.fonts, &CharProps::default());
@@ -781,6 +795,15 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
             // Field begin/separator/end ([MS-DOC] §2.9.84 Plcfld).
             '\u{13}' => {
                 match field.as_mut() {
+                    // A field inside another's result: the outer one becomes a range field and
+                    // the inner one is read on its own, its instruction hidden as any other's.
+                    Some(f) if f.depth == 1 && f.sep.is_some() => {
+                        if let Some(f) = field.take() {
+                            ranges.push(open_range(&mut pb, f, ctx.work));
+                        }
+                        field = Some(FieldBuild { depth: 1, instr: String::new(), sep: None, anchor: anchor_props(ctx, cp) });
+                    }
+                    // A field inside another's instruction is part of that instruction.
                     Some(f) => {
                         f.depth = f.depth.saturating_add(1);
                     }
@@ -807,6 +830,9 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                     } else {
                         finish_field(&mut pb, f, ctx.work);
                     }
+                } else if ranges.pop().is_some() {
+                    pb.push('\u{FFFC}', anchor_props(ctx, cp));
+                    pb.objects.push(InlineObject::FieldEnd);
                 }
                 cp = cp.saturating_add(1);
                 continue;
@@ -857,6 +883,36 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                 if let Some((_, kind, id)) = ctx.notes.get(at).filter(|(c, _, _)| *c == cp) {
                     pb.push('\u{FFFC}', anchor_props(ctx, cp));
                     pb.objects.push(InlineObject::NoteRef { kind: *kind, id: *id, custom: String::new() });
+                }
+            }
+            _ if field.is_none() && ranges.last().is_some_and(Option::is_some) && !matches!(c, '\u{0}'..='\u{8}' | '\u{A}' | '\u{D}'..='\u{12}' | '\u{16}'..='\u{1D}') => {
+                // The visible result of a hyperlink written as a range field keeps its target.
+                let link = ranges.last().cloned().flatten();
+                let c = match c {
+                    '\u{B}' => '\n',
+                    '\u{1E}' => '\u{2011}',
+                    '\u{1F}' => '\u{AD}',
+                    c => c,
+                };
+                let at = pb.text.len();
+                push_formatted(&mut pb, cp, c, ctx, None, &mut fmt);
+                // Re-pushed with the target: `push` joins it to the linked run before it.
+                if let Some(link) = link
+                    && pb.text.len() > at
+                    && pb.runs.last().is_some_and(|r| r.props.link.is_none())
+                    && let Some(mut props) = fmt.memo.as_ref().map(|m| m.props.clone())
+                {
+                    let pushed: String = pb.text.split_off(at);
+                    if let Some(r) = pb.runs.last_mut() {
+                        r.len = r.len.saturating_sub(pushed.len());
+                        if r.len == 0 {
+                            pb.runs.pop();
+                        }
+                    }
+                    props.link = Some(link);
+                    for ch in pushed.chars() {
+                        pb.push(ch, props.clone());
+                    }
                 }
             }
             '\t' => push_formatted(&mut pb, cp, '\t', ctx, field.as_mut(), &mut fmt),
@@ -965,6 +1021,35 @@ fn finish_field(pb: &mut ParaBuild, f: FieldBuild, work: &Work) {
     }
     pb.push('\u{FFFC}', f.anchor);
     pb.objects.push(InlineObject::Field { instr, result: result.text, locked: false, dirty: false, code: false, form: String::new() });
+}
+
+/// Turn a field whose result goes on past a paragraph mark or holds another field into a range
+/// field: a `FieldStart` with its instruction, then the result read so far as text. Returns the
+/// hyperlink target its later result text keeps, if it is a hyperlink.
+fn open_range(pb: &mut ParaBuild, f: FieldBuild, work: &Work) -> Option<String> {
+    let instr = f.instr.trim().to_string();
+    let target = hyperlink_target(&instr);
+    pb.push('\u{FFFC}', f.anchor);
+    pb.objects.push(InlineObject::FieldStart { instr, locked: false, dirty: false });
+    let result = f.sep.unwrap_or_default();
+    let mut chars = result.text.chars();
+    for (len, mut props) in result.runs {
+        if let Some(t) = &target
+            && work.charge(t.len() as u64, Cost::LinkTarget)
+        {
+            props.link = Some(t.clone());
+        }
+        let mut left = len;
+        let Some(first) = chars.next() else { break };
+        pb.push(first, props);
+        left = left.saturating_sub(first.len_utf8());
+        while left > 0 {
+            let Some(c) = chars.next() else { break };
+            pb.extend(c);
+            left = left.saturating_sub(c.len_utf8());
+        }
+    }
+    target
 }
 
 /// `sprmCPicLocation` from a CHPX grpprl: the fc of the picture in the Data stream.

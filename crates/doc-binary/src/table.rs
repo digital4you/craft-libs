@@ -394,7 +394,27 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
             }
             continue;
         }
-        if let Some(p) = it.next() {
+        if let Some(mut p) = it.next() {
+            // A drop cap is stored as a paragraph of its own (the letter, with sprmPDcs and its
+            // frame) before the paragraph it starts; the model keeps it as that paragraph's
+            // property, so the two are joined.
+            if p.para.props.drop_cap.is_some()
+                && !p.para.text.is_empty()
+                && p.para.section.is_none()
+                && it.peek().is_some_and(|n| level_of(n) == 0 && !n.para.text.is_empty())
+                && let Some(next) = it.next()
+            {
+                let mut head = p.para;
+                let mut props = next.para.props.clone();
+                props.drop_cap = head.props.drop_cap;
+                props.drop_cap_margin = head.props.drop_cap_margin;
+                props.drop_cap_distance = head.props.frame.as_ref().map(|f| f.h_space).filter(|d| *d > 0.0);
+                let mark = next.para.mark.clone();
+                head.append(next.para);
+                head.props = props;
+                head.mark = mark;
+                p.para = head;
+            }
             out.push(para_block(p.para));
         }
     }

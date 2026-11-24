@@ -337,6 +337,96 @@ fn change_tabs(p: &mut ParaProps, prl: &Prl) {
     p.tabs = Some(tabs);
 }
 
+/// One frame sprm onto the paragraph's frame, created with the binary format's defaults
+/// (horizontally from the column, vertically from the margin, automatic wrap).
+fn frame_sprm(p: &mut ParaProps, prl: &Prl) {
+    let f = p.frame.get_or_insert_with(|| craft_wordmodel::props::TextFrame {
+        h_anchor: "text".into(),
+        v_anchor: "margin".into(),
+        wrap: "auto".into(),
+        ..Default::default()
+    });
+    let v = u16_of(prl).unwrap_or(0);
+    let pt = |v: u16| (v as i16 as f32 / 20.0).clamp(-1584.0, 1584.0);
+    match prl.op {
+        0x261B => {
+            let b = prl.operand.first().copied().unwrap_or(0);
+            match (b >> 4) & 3 {
+                0 => f.v_anchor = "margin".into(),
+                1 => f.v_anchor = "page".into(),
+                2 => f.v_anchor = "text".into(),
+                _ => {}
+            }
+            match (b >> 6) & 3 {
+                0 => f.h_anchor = "text".into(),
+                1 => f.h_anchor = "margin".into(),
+                2 => f.h_anchor = "page".into(),
+                _ => {}
+            }
+        }
+        // XAS: 0 left, -4 center, -8 right, -12 inside, -16 outside, else a position.
+        0x8418 => {
+            f.x_align = match v as i16 {
+                0 => Some("left".into()),
+                -4 => Some("center".into()),
+                -8 => Some("right".into()),
+                -12 => Some("inside".into()),
+                -16 => Some("outside".into()),
+                _ => {
+                    f.x = pt(v);
+                    None
+                }
+            };
+        }
+        // YAS: -4 top, -8 center, -12 bottom, -16 inside, -20 outside, else a position.
+        0x8419 => {
+            f.y_align = match v as i16 {
+                -4 => Some("top".into()),
+                -8 => Some("center".into()),
+                -12 => Some("bottom".into()),
+                -16 => Some("inside".into()),
+                -20 => Some("outside".into()),
+                _ => {
+                    f.y = pt(v);
+                    None
+                }
+            };
+        }
+        0x841A => f.w = Some(pt(v).max(0.0)).filter(|w| *w > 0.0),
+        0x442B => {
+            let h = (v & 0x7FFF) as f32 / 20.0;
+            f.h = (h > 0.0).then_some(h.min(1584.0));
+            f.h_exact = v & 0x8000 == 0;
+        }
+        0x842E => f.v_space = pt(v).max(0.0),
+        0x842F => f.h_space = pt(v).max(0.0),
+        0x2423 => {
+            f.wrap = match prl.operand.first().copied().unwrap_or(0) {
+                1 => "notBeside",
+                2 => "around",
+                3 => "none",
+                4 => "tight",
+                5 => "through",
+                _ => "auto",
+            }
+            .into()
+        }
+        _ => {}
+    }
+}
+
+/// Drops a frame no sprm placed: Word writes the wrap or the distances from the text on
+/// paragraphs that are not framed, and a frame at the column's top left with no size is no
+/// frame. A drop cap keeps its frame.
+pub(crate) fn settle_frame(p: &mut ParaProps) {
+    let placed = p.frame.as_ref().is_some_and(|f| {
+        f.x != 0.0 || f.y != 0.0 || f.w.is_some() || f.h.is_some() || f.x_align.as_deref().is_some_and(|a| a != "left") || f.y_align.is_some() || f.h_anchor != "text" || f.v_anchor != "margin"
+    });
+    if !placed && p.drop_cap.is_none() {
+        p.frame = None;
+    }
+}
+
 /// Apply a paragraph-property sprm.
 pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
     let tw = |v: i32| (v as f32 / 20.0).clamp(-1000.0, 1000.0);
@@ -352,6 +442,24 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 _ => Some(Align::Left),
             };
         }
+        // Drop cap ([MS-DOC] §2.9.61 DCS): fdct (bits 0-2: 1 dropped, 2 in the margin) and the
+        // lines it drops (bits 3-7).
+        0x442C => {
+            if let Some(v) = u16_of(prl) {
+                let (fdct, lines) = (v & 7, ((v >> 3) & 0x1F) as u8);
+                if fdct == 0 || lines == 0 {
+                    p.drop_cap = None;
+                    p.drop_cap_margin = None;
+                } else {
+                    p.drop_cap = Some(lines);
+                    p.drop_cap_margin = Some(fdct == 2);
+                }
+            }
+        }
+        // Frame placement ([MS-DOC] §2.6.2): sprmPPc, sprmPDxaAbs, sprmPDyaAbs, sprmPDxaWidth,
+        // sprmPWHeightAbs, sprmPDyaFromText, sprmPDxaFromText and sprmPWr. The frame is kept
+        // only when something places it (see `settle_frame`).
+        0x261B | 0x8418 | 0x8419 | 0x841A | 0x442B | 0x842E | 0x842F | 0x2423 => frame_sprm(p, prl),
         P_DXA_LEFT | P_DXA_LEFT80 => {
             if let Some(v) = s16(prl) {
                 p.indent_left = Some(tw(v as i32));
