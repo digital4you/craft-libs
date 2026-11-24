@@ -781,6 +781,10 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                 let (istd, papx) = ctx.papx_bins.papx(ctx.word, fc_mark);
                 // The Prm of the piece holding the mark adds its paragraph sprms after the PAPX's
                 // ([MS-DOC] §2.4.6.1, step 5), as Word 6/95's fast saves record a paragraph change.
+                // A PAPX too large for its FKP holds only sprmPHugePapx, the Data-stream offset of
+                // the real grpprl (a PrcData, [MS-DOC] sprmPHugePapx): that one is read in its place.
+                let huge = huge_papx(papx, ctx.data, ctx.work);
+                let papx: &[u8] = huge.as_deref().unwrap_or(papx);
                 let extra = prm_paragraph_sprms(ctx.pieces.piece_prm(cp), ctx.work);
                 let combined;
                 let papx: &[u8] = if extra.is_empty() {
@@ -1289,6 +1293,28 @@ fn prm_paragraph_sprms(prm: PrmRef<'_>, work: &Work) -> Vec<u8> {
         PrmRef::None | PrmRef::Grpprl { grpprl: None, .. } => {}
     }
     out
+}
+
+/// `sprmPHugePapx` (0x6646) in a PAPX: the paragraph's sprms read from the PrcData at its
+/// operand's offset in the Data stream (`cbGrpprl`, at most 0x3FA2, then the grpprl), with the
+/// PAPX's own other sprms before them ([MS-DOC] sprmPHugePapx, PrcData). None without the sprm, or
+/// when the PrcData lies outside the stream. The copy is charged to `work` ([`MAX_WORK`]), as a
+/// hostile file can point every paragraph at the same 16 KB.
+fn huge_papx(papx: &[u8], data: &[u8], work: &Work) -> Option<Vec<u8>> {
+    const P_HUGE_PAPX: u16 = 0x6646;
+    let at = sprm::iter(papx).find(|p| p.op == P_HUGE_PAPX).and_then(|p| p.operand.get(..4))?;
+    let at = u32::from_le_bytes([at[0], at[1], at[2], at[3]]) as usize;
+    let cb = data.get(at..at.checked_add(2)?).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+    let grpprl = data.get(at + 2..(at + 2).checked_add(usize::from(cb).min(0x3FA2))?)?;
+    if !work.charge(grpprl.len() as u64, Cost::Formatting) {
+        return None;
+    }
+    let mut out: Vec<u8> = sprm::iter(papx)
+        .filter(|p| p.op != P_HUGE_PAPX)
+        .flat_map(|p| p.op.to_le_bytes().into_iter().chain(p.operand.iter().copied()))
+        .collect();
+    out.extend_from_slice(grpprl);
+    Some(out)
 }
 
 /// Apply a piece's Prm (Prm0 short sprm or Prm1 grpprl) to character properties. A Prm1
