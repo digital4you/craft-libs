@@ -42,11 +42,14 @@ const P_DXC_LEFT: u16 = 0x4456;
 const P_DXC_FIRST: u16 = 0x4457;
 const P_DYA_BEFORE: u16 = 0xA413;
 const P_DYA_AFTER: u16 = 0xA414;
+const P_DYA_BEFORE_AUTO: u16 = 0x245B; // sprmPFDyaBeforeAuto
+const P_DYA_AFTER_AUTO: u16 = 0x245C; // sprmPFDyaAfterAuto
 const P_DYA_LINE: u16 = 0x6412;
 const P_KEEP: u16 = 0x2405; // keep lines together
 const P_KEEP_FOLLOW: u16 = 0x2406; // keep with next
 const P_PAGE_BREAK_BEFORE: u16 = 0x2407;
 const P_OUTLVL: u16 = 0x2640;
+const P_CONTEXTUAL_SPACING: u16 = 0x246D; // sprmPFContextualSpacing
 // Paragraph borders ([MS-DOC] §2.6.2). The 80 forms carry a Brc80 (palette colour), the
 // newer ones a BrcOperand: cb(1) + Brc(8, with a full COLORREF).
 const P_BRC_TOP80: u16 = 0x6424;
@@ -493,6 +496,18 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 }
             }
         }
+        // HTML-style automatic space before and after ([MS-DOC] sprmPFDyaBeforeAuto,
+        // sprmPFDyaAfterAuto), as the Normal (Web) style of pages saved from a browser sets.
+        P_DYA_BEFORE_AUTO => {
+            if let Some(&v) = prl.operand.first() {
+                p.space_before_auto = Some(v != 0);
+            }
+        }
+        P_DYA_AFTER_AUTO => {
+            if let Some(&v) = prl.operand.first() {
+                p.space_after_auto = Some(v != 0);
+            }
+        }
         P_DYA_BEFORE => {
             if let Some(v) = s16(prl) {
                 p.space_before = Some((v as f32 / 20.0).clamp(0.0, 3168.0));
@@ -531,6 +546,13 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
         P_PAGE_BREAK_BEFORE => {
             if matches!(sprm::toggle(prl), Toggle::On) {
                 p.page_break_before = Some(true);
+            }
+        }
+        // No space before or after between paragraphs of the same style ([MS-DOC]
+        // sprmPFContextualSpacing), as List Paragraph sets.
+        P_CONTEXTUAL_SPACING => {
+            if let Some(&v) = prl.operand.first() {
+                p.contextual_spacing = Some(v != 0);
             }
         }
         P_OUTLVL => {
