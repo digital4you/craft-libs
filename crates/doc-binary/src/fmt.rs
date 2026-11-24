@@ -291,7 +291,7 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
                 p.highlight = Some(*h);
             }
         }
-        C_ISTD => {} // resolved separately through the style table
+        C_ISTD => {} // applied first, by `apply_char_style`
         _ => {}
     }
 }
@@ -698,6 +698,20 @@ fn display_name(name: &str) -> String {
         "body text" => "Body Text".into(),
         _ => style_id(name),
     }
+}
+
+/// The run's character style, from the last sprmCIstd in its CHPX `grpprl` ([MS-DOC] sprmCIstd):
+/// the style's properties and its base styles', root first, are applied over `chr` (the
+/// paragraph style's), which then names the style. A style index that names no character style
+/// (a damaged file) changes nothing.
+pub(crate) fn apply_char_style(chr: &mut CharProps, grpprl: &[u8], raw: &[crate::stsh::RawStyle], fonts: &[String]) {
+    let Some(istd) = sprm::iter(grpprl).filter(|p| p.op == C_ISTD).filter_map(|p| u16_of(&p)).last() else { return };
+    let istd = usize::from(istd);
+    let Some(st) = raw.get(istd).filter(|s| s.stk == 2 && !s.name.is_empty()) else { return };
+    for s in style_chain(raw, istd).into_iter().filter_map(|i| raw.get(i)) {
+        apply_chain(chr, &s.chpx, fonts);
+    }
+    chr.style = Some(style_id(&st.name));
 }
 
 /// Apply a grpprl of character sprms with a toggle base.

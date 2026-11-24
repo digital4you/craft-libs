@@ -1226,6 +1226,17 @@ fn push_formatted<'a>(pb: &mut ParaBuild, cp: u32, c: char, ctx: &WalkCtx<'a>, f
                 &default
             }
         };
+        // A character style applies over the paragraph style's properties, and the run's own
+        // toggles then invert what the two give together ([MS-DOC] sprmCIstd, sprmCFBold).
+        let styled;
+        let base = if sprm::iter(grpprl).any(|p| p.op == 0x4A30) {
+            let mut b = base.clone();
+            fmt::apply_char_style(&mut b, grpprl, ctx.raw_styles, ctx.fonts);
+            styled = b;
+            &styled
+        } else {
+            base
+        };
         let mut props = char_props(grpprl, ctx.fonts, base);
         let piece_prm = ctx.pieces.piece_prm(cp);
         apply_prm(&mut props, piece_prm, ctx.fonts, base, ctx.work);
