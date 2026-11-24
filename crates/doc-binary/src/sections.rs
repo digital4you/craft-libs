@@ -154,14 +154,17 @@ fn apply_section(s: &mut SectionProps, prl: &Prl) {
                 s.margin_right = tw(v as i32);
             }
         }
+        // A negative top or bottom margin is that margin, kept even when a header or footer would
+        // push the text away ([MS-DOC] sprmSDyaTop, sprmSDyaBottom); the layout uses its size, as
+        // the DOCX reader does for w:pgMar.
         S_DYA_TOP => {
             if let Some(v) = s16(prl) {
-                s.margin_top = tw(v as i32);
+                s.margin_top = tw((v as i32).abs());
             }
         }
         S_DYA_BOTTOM => {
             if let Some(v) = s16(prl) {
-                s.margin_bottom = tw(v as i32);
+                s.margin_bottom = tw((v as i32).abs());
             }
         }
         S_DXA_GUTTER => {
