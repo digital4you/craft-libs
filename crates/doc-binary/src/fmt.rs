@@ -26,6 +26,8 @@ const C_FTC1: u16 = 0x4A50; // East Asian font index (sprmCRgFtc1)
 const C_FTC_BI: u16 = 0x4A5E; // complex-script font index (sprmCFtcBi)
 const C_HIGHLIGHT: u16 = 0x2A0C;
 const C_ISTD: u16 = 0x4A30; // character style
+const C_DXA_SPACE: u16 = 0x8840; // expanded/condensed spacing, twips (sprmCDxaSpace)
+const C_CHAR_SCALE: u16 = 0x4852; // horizontal scale, percent (sprmCCharScale)
 
 // Paragraph sprms ([MS-DOC] §2.6.2).
 const P_JC: u16 = 0x2461;
@@ -292,6 +294,18 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
             }
         }
         C_ISTD => {} // applied first, by `apply_char_style`
+        // Character spacing and scale ([MS-DOC] sprmCDxaSpace, sprmCCharScale), within the
+        // ranges the specification allows.
+        C_DXA_SPACE => {
+            if let Some(v) = s16_of(prl) {
+                p.spacing = Some((f32::from(v) / 20.0).clamp(-79.0, 1584.0));
+            }
+        }
+        C_CHAR_SCALE => {
+            if let Some(v) = u16_of(prl) {
+                p.scale = Some(f32::from(v.clamp(1, 600)));
+            }
+        }
         _ => {}
     }
 }
