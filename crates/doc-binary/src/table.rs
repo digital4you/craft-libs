@@ -15,7 +15,7 @@ use crate::sprm::{self, Prl};
 // Paragraph sprms for table membership.
 const P_IN_TABLE: u16 = 0x2416;
 const P_TTP: u16 = 0x2417;
-/// `sprmPItap`: table depth (we only model depth 1; deeper rows fall back to paragraphs).
+/// `sprmPItap`: the table depth of a paragraph (1 for the outer table, more for nested ones).
 const P_ITAP: u16 = 0x6649;
 
 // Table sprms ([MS-DOC] §2.6.3).
@@ -49,6 +49,40 @@ const T_CELL_WIDTH: u16 = 0xD635;
 /// edge is fine but merged rows can sum spans slightly over, so clamp when assembling).
 const MAX_COLS: usize = 63;
 
+// Nested tables ([MS-DOC] §2.4.3): inner cells end at a paragraph mark with
+// `sprmPFInnerTableCell`, inner rows at one with `sprmPFInnerTtp`.
+const P_INNER_TABLE_CELL: u16 = 0x244B;
+const P_INNER_TTP: u16 = 0x244C;
+/// `sprmTTableBorders`: six `Brc`s (8 bytes each) in the order of `sprmTTableBorders80`.
+const T_TABLE_BORDERS: u16 = 0xD613;
+/// `sprmTCellPaddingDefault` and `sprmTCellPadding`: a `CSSA` (itcFirst, itcLim, grfbrc,
+/// ftsWidth, wWidth) after the cb byte.
+const T_CELL_PADDING_DEFAULT: u16 = 0xD632;
+const T_CELL_PADDING: u16 = 0xD634;
+/// `sprmTTableWidth`: the table's preferred width, an `FtsWWidth_Table`.
+const T_TABLE_WIDTH: u16 = 0xF614;
+/// `sprmTFAutofit`: 0 = fixed column widths.
+const T_FAUTOFIT: u16 = 0x3615;
+/// Deepest table nesting we build; deeper marks are treated as this depth, so hostile depths
+/// cannot recurse without bound. Word itself stops at 63.
+const MAX_NEST: u32 = 16;
+
+/// A cell's `TC80` from `sprmTDefTable` ([MS-DOC] §2.9.313): its `TCGRF` merge and alignment
+/// bits and the borders it states.
+#[derive(Default, Clone)]
+struct Tc {
+    /// `fFirstMerged` (bit 0) and `fMerged` (bit 1): a cell with only `fMerged` continues the
+    /// horizontal merge of the cell before it.
+    hmerge: u8,
+    /// `fVertMerge` (bit 0 here) and `fVertRestart` (bit 1 here).
+    vmerge: u8,
+    /// `vertAlign`: 0 top, 1 center, 2 bottom.
+    valign: u8,
+    /// The borders the TC80 states; a zeroed `Brc80` states nothing and the cell keeps the
+    /// table's border on that side.
+    borders: Option<Borders>,
+}
+
 /// What a paragraph mark says about its table context, from its PAPX.
 #[derive(Default)]
 pub(crate) struct RowInfo {
@@ -56,12 +90,16 @@ pub(crate) struct RowInfo {
     pub(crate) ttp: bool,
     /// The mark itself was 0x07 (a cell end), set by the walker.
     pub(crate) cell_mark: bool,
-    /// Table depth from `sprmPItap` (0 or 1 supported; deeper tables degrade to paragraphs).
+    /// Table depth from `sprmPItap` (0 when the PAPX does not state it).
     pub(crate) depth: u32,
+    /// `sprmPFInnerTableCell` / `sprmPFInnerTtp`: the mark ends a nested cell or row.
+    pub(crate) inner_cell: bool,
+    pub(crate) inner_ttp: bool,
     /// Cell-edge positions (points) from `sprmTDefTable` — [MS-DOC] defines them per row,
     /// so each row keeps its own; ascending in well-formed rows, the first edge usually 0
     /// (the row origin). Rows without a `sprmTDefTable` keep this empty.
     pub(crate) edges: Vec<f32>,
+    tcs: Vec<Tc>,
     height: Option<f32>,
     height_rule: HeightRule,
     header: bool,
@@ -69,6 +107,11 @@ pub(crate) struct RowInfo {
     align: Option<Align>,
     indent: Option<f32>,
     borders: Option<Borders>,
+    /// Default cell margins (top, left, bottom, right), points.
+    margins: Option<[f32; 4]>,
+    width: Option<f32>,
+    width_pct: Option<f32>,
+    fixed: bool,
     /// Horizontal merges: (itcFirst, itcLim) cell-index ranges.
     merges: Vec<(u8, u8)>,
     /// Per-cell overrides keyed by (pre-merge) cell index.
@@ -85,7 +128,30 @@ pub(crate) struct RowInfo {
 impl RowInfo {
     /// Does the mark belong to a table: inside one, ending a row, or ending a cell?
     pub(crate) fn is_table(&self) -> bool {
-        self.in_table || self.ttp || self.cell_mark
+        self.in_table || self.ttp || self.cell_mark || self.depth > 0 || self.inner_cell || self.inner_ttp
+    }
+
+    /// The table depth of the mark: `sprmPItap` when stated, else 1 for any table mark.
+    fn level(&self) -> u32 {
+        if self.depth > 0 {
+            self.depth.min(MAX_NEST)
+        } else if self.is_table() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Does this mark end a row of a table at `level`? The outer table's rows end at a TTP
+    /// mark, a nested table's at an inner TTP mark ([MS-DOC] §2.4.3).
+    fn ends_row(&self, level: u32) -> bool {
+        if level <= 1 { self.ttp || (self.cell_mark && self.inner_ttp && self.level() == 1) } else { self.inner_ttp }
+    }
+
+    /// Does this mark end a cell of a table at `level`: a cell mark (0x07) in the outer table,
+    /// a paragraph mark with `sprmPFInnerTableCell` in a nested one?
+    fn ends_cell(&self, level: u32) -> bool {
+        if level <= 1 { self.cell_mark } else { self.inner_cell }
     }
 
     /// The row height from `sprmTDyaRowHeight`, for tests.
@@ -132,14 +198,21 @@ pub(crate) fn decode(papx: &[u8]) -> RowInfo {
     let mut r = RowInfo::default();
     let mut gap_half: Option<i16> = None;
     let mut dxa_left: Option<i16> = None;
+    // Cell padding by side (top, left, bottom, right), points.
+    let mut padding: [Option<f32>; 4] = [None; 4];
     for prl in sprm::iter(papx) {
         // The membership sprms are paragraph sprms (sgc 1); the rest here are table sprms
         // (sgc 5), so match opcodes directly.
         match prl.op {
             P_IN_TABLE => r.in_table = prl.operand.first().copied().unwrap_or(0) != 0,
             P_TTP => r.ttp = prl.operand.first().copied().unwrap_or(0) != 0,
+            P_INNER_TABLE_CELL => r.inner_cell = prl.operand.first().copied().unwrap_or(0) != 0,
+            P_INNER_TTP => r.inner_ttp = prl.operand.first().copied().unwrap_or(0) != 0,
             P_ITAP => r.depth = i32_of(&prl).unwrap_or(0).max(0) as u32,
-            T_DEF_TABLE => r.edges = def_table_edges(prl.operand),
+            T_DEF_TABLE => {
+                r.edges = def_table_edges(prl.operand);
+                r.tcs = def_table_tcs(prl.operand);
+            }
             T_TABLE_HEADER => r.header = prl.operand.first().copied().unwrap_or(0) != 0,
             T_CANT_SPLIT | T_CANT_SPLIT_90 => r.cant_split = prl.operand.first().copied().unwrap_or(0) != 0,
             T_ROW_HEIGHT => {
@@ -163,6 +236,33 @@ pub(crate) fn decode(papx: &[u8]) -> RowInfo {
             T_DXA_LEFT => dxa_left = s16(&prl),
             T_DXA_GAP_HALF => gap_half = s16(&prl),
             T_TABLE_BORDERS_80 => r.borders = table_borders(prl.operand),
+            T_TABLE_BORDERS => r.borders = table_borders_brc(prl.operand),
+            T_CELL_PADDING_DEFAULT | T_CELL_PADDING => {
+                // cb, itcFirst, itcLim, grfbrc (1 top, 2 left, 4 bottom, 8 right), ftsWidth
+                // (3 = twips), wWidth. Padding of the first cell stands for the table's default.
+                if let [_, first, _, sides, fts, w0, w1, ..] = prl.operand
+                    && *fts == 3
+                    && (*first == 0 || prl.op == T_CELL_PADDING_DEFAULT)
+                {
+                    let w = (u16::from_le_bytes([*w0, *w1]) as f32 / 20.0).min(1584.0);
+                    for (bit, slot) in [(1u8, 0usize), (2, 1), (4, 2), (8, 3)] {
+                        if sides & bit != 0 {
+                            padding[slot] = Some(w);
+                        }
+                    }
+                }
+            }
+            T_TABLE_WIDTH => {
+                if let [fts, w0, w1, ..] = prl.operand {
+                    let w = u16::from_le_bytes([*w0, *w1]);
+                    match fts {
+                        2 => r.width_pct = Some((w as f32 / 50.0).clamp(0.0, 100.0)).filter(|p| *p > 0.0),
+                        3 => r.width = Some((w as i16 as f32 / 20.0).clamp(0.0, 1584.0)).filter(|w| *w > 0.0),
+                        _ => {}
+                    }
+                }
+            }
+            T_FAUTOFIT => r.fixed = prl.operand.first() == Some(&0),
             T_MERGE => {
                 // Rows apply only the first MAX_COLS merges.
                 if let [a, b, ..] = prl.operand
@@ -255,10 +355,15 @@ pub(crate) fn decode(papx: &[u8]) -> RowInfo {
             _ => {}
         }
     }
-    // The table indent is the row origin minus half the cell gap.
+    // [MS-DOC] §2.6.3: `sprmTDxaLeft` is the row's left edge (the first cell's left boundary);
+    // the table indent is that edge, as Word lays out a Word 97-2003 table (compatibility mode).
     if let Some(l) = dxa_left {
-        let gap = gap_half.unwrap_or(0) as f32 / 20.0;
-        r.indent = Some(((l as f32 / 20.0) - gap).clamp(-1584.0, 1584.0));
+        r.indent = Some((l as f32 / 20.0).clamp(-1584.0, 1584.0));
+    }
+    // `sprmTDxaGapHalf` is each cell's left and right margin unless a padding sprm names the side.
+    if gap_half.is_some() || padding.iter().any(Option::is_some) {
+        let gap = gap_half.map_or(5.4, |g| (g.max(0) as f32 / 20.0).min(1584.0));
+        r.margins = Some([padding[0].unwrap_or(0.0), padding[1].unwrap_or(gap), padding[2].unwrap_or(0.0), padding[3].unwrap_or(gap)]);
     }
     r
 }
@@ -272,132 +377,112 @@ pub(crate) struct ParaOut {
     pub(crate) row: Option<Box<RowInfo>>,
 }
 
-/// Group consecutive in-table paragraphs into [`Table`] blocks; the rest pass through.
-/// Rows that never close (or tables nested deeper than we model) degrade to paragraphs so
-/// no text is lost.
+fn level_of(p: &ParaOut) -> u32 {
+    p.row.as_ref().map_or(0, |r| r.level())
+}
+
+/// Group in-table paragraphs into [`Table`] blocks, nested tables inside their cells
+/// ([MS-DOC] §2.4.3); the rest pass through. A row that never closes is kept as a row, so no
+/// text is lost.
 pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
+    let mut it = paras.into_iter().peekable();
     let mut out: Blocks = Vec::new();
-    let mut rows: Vec<Row> = Vec::new();
+    while let Some(next) = it.peek() {
+        if level_of(next) > 0 {
+            if let Some(t) = table(&mut it, 1) {
+                out.push(Arc::new(Block::Table(t)));
+            }
+            continue;
+        }
+        if let Some(p) = it.next() {
+            out.push(para_block(p.para));
+        }
+    }
+    out
+}
+
+/// One cell before merging: its blocks and the pre-merge index it had in its row.
+fn flush_cell(cells: &mut Vec<Cell>, cell: &mut Blocks) {
+    let mut blocks = std::mem::take(cell);
+    if blocks.is_empty() {
+        blocks.push(para_block(Paragraph::new()));
+    }
+    cells.push(Cell { props: CellProps { span: 1, ..Default::default() }, blocks, controls: Default::default() });
+}
+
+/// The table at `level`: cells end at that level's cell marks, rows at its row marks, and
+/// deeper marks form tables nested in the current cell.
+fn table(it: &mut std::iter::Peekable<std::vec::IntoIter<ParaOut>>, level: u32) -> Option<Table> {
+    let mut rows: Vec<(Vec<Cell>, Box<RowInfo>)> = Vec::new();
     let mut cells: Vec<Cell> = Vec::new();
     let mut cell: Blocks = Vec::new();
-    let mut grid: Vec<f32> = Vec::new();
-    let mut props = TableProps::default();
-    let mut open = false;
-    let mut depth_seen = 0u32;
-
-    fn flush_cell(cells: &mut Vec<Cell>, cell: &mut Blocks) {
-        let mut blocks = std::mem::take(cell);
-        if blocks.is_empty() {
-            blocks.push(para_block(Paragraph::new()));
+    while let Some(next) = it.peek() {
+        let l = level_of(next);
+        if l < level {
+            break;
         }
-        cells.push(Cell { props: CellProps { span: 1, ..Default::default() }, blocks, controls: Default::default() });
-    }
-    fn build_row(mut cells: Vec<Cell>, info: &RowInfo) -> Row {
-        // Per-cell overrides first (sprm cell indices count pre-merge cells), then merges.
-        for (i, c) in cells.iter_mut().enumerate() {
-            let i = i as u8;
-            if let Some((_, m)) = info.vmerge.iter().find(|(k, _)| *k == i) {
-                c.props.vmerge = *m;
+        if l > level {
+            if let Some(t) = table(it, level + 1) {
+                cell.push(Arc::new(Block::Table(t)));
             }
-            if let Some((_, w)) = info.widths.iter().rfind(|(k, _)| *k == i) {
-                c.props.width = Some(*w);
-            }
-            if let Some((_, pct)) = info.width_pcts.iter().rfind(|(k, _)| *k == i) {
-                c.props.width_pct = Some(*pct);
-            }
-            if let Some((_, s)) = info.shading.iter().rfind(|(k, _)| *k == i) {
-                c.props.shading = *s;
-            }
-            if let Some((_, v)) = info.valign.iter().rfind(|(k, _)| *k == i) {
-                c.props.valign = Some(*v);
-            }
-        }
-        for &(a, b) in info.merges.iter().take(MAX_COLS) {
-            let a = a as usize;
-            let b = (b as usize).min(cells.len());
-            if a < b && b <= cells.len() && b - a > 1 {
-                let removed: Vec<Cell> = cells.drain(a + 1..b).collect();
-                if let Some(first) = cells.get_mut(a) {
-                    first.props.span = ((b - a) as u32).min(63);
-                    for c in removed {
-                        first.blocks.extend(c.blocks.into_iter().filter(|x| x.as_para().is_none_or(|p| !p.is_empty())));
-                    }
-                    if first.blocks.len() > 1 && first.blocks.first().and_then(|x| x.as_para()).is_some_and(Paragraph::is_empty) {
-                        first.blocks.remove(0);
-                    }
-                }
-            }
-        }
-        Row {
-            props: RowProps {
-                height: info.height,
-                height_rule: info.height_rule,
-                header: info.header,
-                cant_split: info.cant_split,
-                ..Default::default()
-            },
-            cells,
-            controls: Default::default(),
-        }
-    }
-    fn flush_table(out: &mut Blocks, rows: &mut Vec<Row>, cells: &mut Vec<Cell>, cell: &mut Blocks, grid: &[f32], props: &TableProps, nested: bool) {
-        if !cells.is_empty() || !cell.is_empty() {
-            flush_cell(cells, cell);
-            // A stray trailing row (no TTP of its own): size its cells from the grid.
-            let mut stray = build_row(std::mem::take(cells), &RowInfo::default());
-            for (i, c) in stray.cells.iter_mut().enumerate() {
-                if c.props.width.is_none() && c.props.span == 1 {
-                    c.props.width = grid.get(i).copied();
-                }
-            }
-            rows.push(stray);
-        }
-        if rows.is_empty() {
-            return;
-        }
-        if nested {
-            // Unclosed or nested deeper than we model: keep the text, drop the table shape.
-            for r in rows.iter() {
-                for c in &r.cells {
-                    out.extend(c.blocks.iter().cloned());
-                }
-            }
-        } else {
-            out.push(Arc::new(Block::Table(Table {
-                props: props.clone(),
-                grid: grid.to_vec(),
-                rows: std::mem::take(rows),
-                controls: Default::default(),
-            })));
-        }
-        rows.clear();
-    }
-
-    for p in paras {
-        let Some(info) = p.row else {
-            if open {
-                flush_table(&mut out, &mut rows, &mut cells, &mut cell, &grid, &props, depth_seen > 1);
-                grid.clear();
-                // Table props are per-table (first row carrying the sprm wins within the
-                // table): reset the accumulator so one table's borders, align, indent and
-                // cell margins never leak into the next (the repro's first table wrote
-                // Word's default 108-twip gap, and every later table — including the
-                // change history with its own 40-twip gap — inherited 5.4 pt margins).
-                props = TableProps::default();
-                open = false;
-                depth_seen = 0;
-            }
-            out.push(para_block(p.para));
             continue;
-        };
-        if !open {
-            open = true;
         }
-        depth_seen = depth_seen.max(info.depth);
-        if grid.is_empty() {
-            // Column widths from the table's first `sprmTDefTable`.
-            grid = info.edges.windows(2).take(MAX_COLS).map(|w| (w[1] - w[0]).max(0.0)).collect();
+        let Some(p) = it.next() else { break };
+        let Some(info) = p.row else { break };
+        if info.ends_row(level) {
+            // Word writes rows as N content cells each ended by their own cell mark, followed by
+            // an empty row-end mark that carries the row's TDefTable. When that mark ends no
+            // content of its own and the TDefTable already has a column per flushed cell, it is
+            // a pure row terminator, not the end of a phantom (N+1)th cell. A TTP mark with
+            // content, or one short of the TDefTable's columns, still ends a real cell.
+            let row_end_only = p.para.text.is_empty() && cell.is_empty() && !cells.is_empty() && (info.edges.is_empty() || cells.len() + 1 >= info.edges.len());
+            if !p.para.text.is_empty() {
+                cell.push(para_block(p.para));
+            }
+            if !row_end_only {
+                flush_cell(&mut cells, &mut cell);
+            }
+            rows.push((std::mem::take(&mut cells), info));
+            continue;
         }
+        let ends_cell = info.ends_cell(level);
+        cell.push(para_block(p.para));
+        if ends_cell {
+            flush_cell(&mut cells, &mut cell);
+        }
+    }
+    if !cell.is_empty() {
+        flush_cell(&mut cells, &mut cell);
+    }
+    if !cells.is_empty() {
+        // A stray trailing row (no row mark of its own): sized from the previous row's edges.
+        let mut stray = Box::new(RowInfo::default());
+        if let Some((_, last)) = rows.last() {
+            stray.edges = last.edges.clone();
+        }
+        rows.push((cells, stray));
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(build_table(rows))
+}
+
+/// A table from its rows: the grid from every row's cell edges, each cell's span over it, the
+/// table properties from the first row that states each.
+fn build_table(rows: Vec<(Vec<Cell>, Box<RowInfo>)>) -> Table {
+    let mut props = TableProps::default();
+    // The grid: every distinct cell edge of every row ([MS-DOC] defines edges per row).
+    let mut all: Vec<f32> = rows.iter().flat_map(|(_, i)| i.edges.iter().copied()).filter(|e| e.is_finite()).collect();
+    all.sort_by(f32::total_cmp);
+    all.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+    if all.len() > MAX_COLS + 1 {
+        all.truncate(MAX_COLS + 1);
+    }
+    let grid: Vec<f32> = all.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
+    let col_of = |e: f32| all.iter().position(|x| (x - e).abs() < 0.05).or_else(|| all.iter().position(|x| *x >= e));
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for (cells, info) in rows {
         if info.borders.is_some() && props.borders.is_none() {
             props.borders = info.borders;
         }
@@ -407,38 +492,161 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
         if props.indent.is_none() {
             props.indent = info.indent;
         }
-        if info.cell_mark {
-            // A row-end (TTP) mark terminates the row. Word writes rows as N content
-            // cells each ended by their own cell mark, followed by an empty row-end mark
-            // that carries the row's TDefTable (the 3GPP change history: 8 content marks
-            // + an empty TTP whose TDefTable defines itcMac = 8). When that mark ends no
-            // content of its own and the TDefTable already has a column per flushed cell,
-            // it is a pure row terminator, not the end of a phantom (N+1)th cell — such a
-            // cell has no column (width None) and shifts every real cell's span one grid
-            // column over. A TTP mark with content, or one short of the TDefTable's
-            // columns, still ends a real cell (rows without a TDefTable keep today's
-            // shape: the count is unknowable, so the mark always flushes).
-            let row_end_only = info.ttp && p.para.text.is_empty() && cell.is_empty() && !info.edges.is_empty() && cells.len() + 1 >= info.edges.len();
-            // ...but a row-end mark with no cells before it still makes a (one-cell) row.
-            let row_end_only = row_end_only && !cells.is_empty();
-            if !p.para.text.is_empty() {
-                cell.push(para_block(p.para));
+        if props.cell_margins.is_none() {
+            props.cell_margins = info.margins;
+        }
+        if props.width.is_none() && props.width_pct.is_none() {
+            props.width = info.width;
+            props.width_pct = info.width_pct;
+        }
+        props.fixed |= info.fixed;
+        let (cells, bounds) = build_row(cells, &info);
+        let mut row = Row {
+            props: RowProps { height: info.height, height_rule: info.height_rule, header: info.header, cant_split: info.cant_split, ..Default::default() },
+            cells,
+            controls: Default::default(),
+        };
+        // Spans over the grid from the cells' edges, with the columns the row leaves out
+        // before and after it.
+        if !grid.is_empty() && info.edges.len() >= 2 {
+            let mut first_col = None;
+            let mut last_col = 0usize;
+            for (c, (a, b)) in row.cells.iter_mut().zip(&bounds) {
+                let (Some(&left), Some(&right)) = (info.edges.get(*a), info.edges.get(*b)) else { break };
+                let (Some(ca), Some(cb)) = (col_of(left), col_of(right)) else { break };
+                if first_col.is_none() {
+                    first_col = Some(ca);
+                }
+                c.props.span = (cb.saturating_sub(ca)).clamp(1, MAX_COLS) as u32;
+                last_col = cb.max(ca + 1);
             }
-            if !row_end_only {
-                flush_cell(&mut cells, &mut cell);
+            if let Some(f) = first_col
+                && f > 0
+            {
+                row.props.grid_before = f as u32;
+                row.props.w_before = Some(grid.iter().take(f).sum());
             }
-            if info.ttp {
-                let row = build_row(std::mem::take(&mut cells), &info);
-                rows.push(row);
+            if last_col > 0 && last_col < grid.len() {
+                row.props.grid_after = (grid.len() - last_col) as u32;
+                row.props.w_after = Some(grid.iter().skip(last_col).sum());
             }
-        } else {
-            cell.push(para_block(p.para));
+        } else if !grid.is_empty() {
+            // A row without edges of its own (a stray row): size its cells from the grid.
+            for (i, c) in row.cells.iter_mut().enumerate() {
+                if c.props.width.is_none() && c.props.span == 1 {
+                    c.props.width = grid.get(i).copied();
+                }
+            }
+        }
+        out_rows.push(row);
+    }
+    if props.indent.is_none() {
+        // Without `sprmTDxaLeft` the row origin (the first cell's left boundary) is the indent.
+        props.indent = all.first().copied().filter(|e| *e != 0.0);
+    }
+    Table { props, grid, rows: out_rows, controls: Default::default() }
+}
+
+/// A row's cells with their own formatting, horizontally merged cells folded into the first
+/// of their range, and for each resulting cell the range of pre-merge edges it covers.
+fn build_row(mut cells: Vec<Cell>, info: &RowInfo) -> (Vec<Cell>, Vec<(usize, usize)>) {
+    // Per-cell formatting first (sprm cell indices count pre-merge cells), then merges.
+    let edge_width = |i: usize| match (info.edges.get(i), info.edges.get(i + 1)) {
+        (Some(a), Some(b)) if b > a => Some((b - a).min(1584.0)),
+        _ => None,
+    };
+    let mut merged_into_prev = vec![false; cells.len()];
+    for (i, c) in cells.iter_mut().enumerate() {
+        if let Some(tc) = info.tcs.get(i) {
+            c.props.vmerge = match tc.vmerge {
+                1 => VMerge::Continue,
+                2 | 3 => VMerge::Restart,
+                _ => VMerge::None,
+            };
+            c.props.valign = match tc.valign {
+                1 => Some(VAlign::Center),
+                2 => Some(VAlign::Bottom),
+                _ => None,
+            };
+            c.props.borders = tc.borders;
+            if tc.hmerge & 3 == 2 && i > 0 {
+                merged_into_prev[i] = true;
+            }
+        }
+        c.props.width = edge_width(i);
+        let i = i as u8;
+        if let Some((_, m)) = info.vmerge.iter().find(|(k, _)| *k == i) {
+            c.props.vmerge = *m;
+        }
+        if let Some((_, w)) = info.widths.iter().rfind(|(k, _)| *k == i) {
+            c.props.width = Some(*w);
+        }
+        if let Some((_, pct)) = info.width_pcts.iter().rfind(|(k, _)| *k == i) {
+            c.props.width_pct = Some(*pct);
+        }
+        if let Some((_, s)) = info.shading.iter().rfind(|(k, _)| *k == i) {
+            c.props.shading = *s;
+        }
+        if let Some((_, v)) = info.valign.iter().rfind(|(k, _)| *k == i) {
+            c.props.valign = Some(*v);
         }
     }
-    if open {
-        flush_table(&mut out, &mut rows, &mut cells, &mut cell, &grid, &props, depth_seen > 1);
+    for &(a, b) in info.merges.iter().take(MAX_COLS) {
+        for m in merged_into_prev.iter_mut().take((b as usize).min(cells.len())).skip(a as usize + 1) {
+            *m = true;
+        }
+    }
+    let mut out: Vec<Cell> = Vec::with_capacity(cells.len());
+    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(cells.len());
+    for (i, c) in cells.into_iter().enumerate() {
+        if merged_into_prev.get(i).copied().unwrap_or(false)
+            && let (Some(first), Some(bound)) = (out.last_mut(), bounds.last_mut())
+        {
+            first.props.span = (first.props.span + 1).min(MAX_COLS as u32);
+            first.props.width = match (first.props.width, c.props.width) {
+                (Some(x), Some(y)) => Some(x + y),
+                (x, _) => x,
+            };
+            // A merged cell's text stays, after the first cell's.
+            first.blocks.extend(c.blocks.into_iter().filter(|x| x.as_para().is_none_or(|p| !p.is_empty())));
+            if first.blocks.len() > 1 && first.blocks.first().and_then(|x| x.as_para()).is_some_and(Paragraph::is_empty) {
+                first.blocks.remove(0);
+            }
+            bound.1 = i + 1;
+            continue;
+        }
+        out.push(c);
+        bounds.push((i, i + 1));
+    }
+    (out, bounds)
+}
+
+/// The TC80s after the edges of a `sprmTDefTable` operand (cb u16, itcMac u8, itcMac+1 edges),
+/// 20 bytes each: TCGRF, wUnused, then the top, left, bottom and right `Brc80`s.
+fn def_table_tcs(operand: &[u8]) -> Vec<Tc> {
+    let itc = (operand.get(2).copied().unwrap_or(0) as usize).min(MAX_COLS);
+    let at = 3 + (itc + 1) * 2;
+    let mut out = Vec::with_capacity(itc);
+    for i in 0..itc {
+        let Some(b) = operand.get(at + i * 20..at + i * 20 + 20) else { break };
+        let grf = u16::from_le_bytes([b[0], b[1]]);
+        let side = |k: usize| b.get(k..k + 4).filter(|x| *x != [0u8; 4]).and_then(fmt::brc80);
+        let borders = Borders { top: side(4), left: side(8), bottom: side(12), right: side(16), ..Default::default() };
+        let stated = borders.top.is_some() || borders.left.is_some() || borders.bottom.is_some() || borders.right.is_some();
+        out.push(Tc { hmerge: (grf & 3) as u8, vmerge: ((grf >> 5) & 3) as u8, valign: ((grf >> 7) & 3) as u8, borders: stated.then_some(borders) });
     }
     out
+}
+
+/// Table borders from `sprmTTableBorders`: cb (0x30) then six `Brc`s of 8 bytes.
+fn table_borders_brc(operand: &[u8]) -> Option<Borders> {
+    let b = |i: usize| {
+        let raw = operand.get(1 + i * 8..1 + i * 8 + 8)?;
+        let mut op = [8u8; 9];
+        op[1..].copy_from_slice(raw);
+        fmt::brc(&op)
+    };
+    Some(Borders { top: b(0), left: b(1), bottom: b(2), right: b(3), between: b(4), inside_v: b(5) })
 }
 
 /// Cell-edge positions (points) from a `sprmTDefTable` operand: cb u16, itcMac u8, then
