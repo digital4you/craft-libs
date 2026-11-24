@@ -32,6 +32,9 @@ pub(crate) struct Bins {
     /// Runs read ahead of time instead of pages (Word 6.0/95, whose FKPs and sprms are another
     /// layout, translated by [`crate::word6`]): sorted by `lo`, not overlapping.
     translated: Option<Vec<TranslatedRun>>,
+    /// For a table whose breakpoints do not ascend (a damaged file): every page's own FC range
+    /// `[first rgfc, last rgfc)` and page number, sorted, read once on the first lookup.
+    by_page: std::cell::OnceCell<Vec<(u32, u32, u32)>>,
 }
 
 /// One run of a [`Bins::translated`] table: the FCs `[lo, hi)` it covers, the paragraph style
@@ -50,7 +53,7 @@ impl Bins {
         let fc = fc as usize;
         let lcb = lcb as usize;
         if lcb < 4 || !(lcb - 4).is_multiple_of(8) {
-            return Ok(Bins { fcs: Vec::new(), sorted: true, pns: Vec::new(), translated: None });
+            return Ok(Bins { fcs: Vec::new(), sorted: true, pns: Vec::new(), translated: None, by_page: Default::default() });
         }
         let end = fc.checked_add(lcb).ok_or_else(|| DocbinError::Malformed("bin table overflow".into()))?;
         let plc = table.get(fc..end).ok_or_else(|| DocbinError::Malformed("bin table outside the Table stream".into()))?;
@@ -69,7 +72,7 @@ impl Bins {
             pns.push(at(n + 1 + i).ok_or_else(|| DocbinError::Malformed("truncated bin aPn".into()))? & 0x003F_FFFF);
         }
         let sorted = fcs.windows(2).all(|w| w.first() <= w.get(1));
-        Ok(Bins { fcs, sorted, pns, translated: None })
+        Ok(Bins { fcs, sorted, pns, translated: None, by_page: Default::default() })
     }
 
     /// A table of runs read ahead of time ([`TranslatedRun`]). Runs are sorted by start; one that
@@ -82,7 +85,7 @@ impl Bins {
                 kept.push(r);
             }
         }
-        Bins { fcs: Vec::new(), sorted: true, pns: Vec::new(), translated: Some(kept) }
+        Bins { fcs: Vec::new(), sorted: true, pns: Vec::new(), translated: Some(kept), by_page: Default::default() }
     }
 
     /// For a translated table: the run covering `fc`, or the gap `[lo, hi)` between runs that
@@ -99,7 +102,19 @@ impl Bins {
     /// The page containing `fc`, as a slice of the WordDocument stream, and the FC range
     /// `[lo, hi)` of its bin (`hi` is `u32::MAX` for the last; an empty range when the table
     /// is not ascending, so nothing is cached from it).
+    ///
+    /// The FKP pages' own `rgfc` are what map FCs to runs ([MS-DOC] §2.9.33 ChpxFkp, §2.9.174
+    /// PapxFkp); the table's breakpoints only index them. When those do not ascend, the page is
+    /// found by its own range instead, as docboss does for every lookup (its `fkp.rs`), so one
+    /// damaged breakpoint does not send the paragraphs around it to the wrong page.
     fn page<'w>(&self, word: &'w [u8], fc: u32) -> Option<(&'w [u8], u32, u32)> {
+        if !self.sorted {
+            let pages = self.by_page.get_or_init(|| self.page_ranges(word));
+            let i = pages.partition_point(|&(lo, _, _)| lo <= fc).checked_sub(1)?;
+            let &(_, _, pn) = pages.get(i).filter(|&&(_, hi, _)| fc < hi)?;
+            let at = pn.checked_mul(512)? as usize;
+            return Some((word.get(at..at.checked_add(512)?)?, 1, 0));
+        }
         let i = self.fcs.partition_point(|&f| f <= fc).checked_sub(1)?;
         let pn = *self.pns.get(i)?;
         let at = pn.checked_mul(512)? as usize;
@@ -110,6 +125,25 @@ impl Bins {
         let lo = self.fcs.get(i).copied().unwrap_or(0);
         let hi = self.fcs.get(i + 1).copied().unwrap_or(u32::MAX);
         Some((page, lo, hi))
+    }
+
+    /// Every page's `[rgfc[0], rgfc[crun])` and page number, sorted by start; pages outside the
+    /// stream or with an empty or inverted range are left out.
+    fn page_ranges(&self, word: &[u8]) -> Vec<(u32, u32, u32)> {
+        let mut out: Vec<(u32, u32, u32)> = self
+            .pns
+            .iter()
+            .filter_map(|&pn| {
+                let at = pn.checked_mul(512)? as usize;
+                let page = word.get(at..at.checked_add(512)?)?;
+                let crun = usize::from(*page.get(511)?).min(0x65);
+                let fc = |i: usize| page.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                let (lo, hi) = (fc(0)?, fc(crun)?);
+                (lo < hi).then_some((lo, hi, pn))
+            })
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// The grpprl of the Chpx covering `fc` ([MS-DOC] ChpxFkp: rgfc u32s, rgb offsets ×2,
