@@ -307,6 +307,16 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     // Word opens Word 97-2003 files in compatibility mode 11 (Word 2003); the model's default
     // 15 would apply Word 2013+ justification and line-breaking rules to them.
     doc.settings.compat_mode = 11;
+    // The default tab stop interval is the Dop's dxaTab, twips at byte 10 ([MS-DOC] Dop, DopBase);
+    // a missing or zero one keeps the model's 720 twips.
+    if let Some((fc, lcb)) = fib.pair(fib::pair::DOP)
+        && lcb >= 12
+        && let Some(b) = table.get(fc as usize + 10..fc as usize + 12)
+        && let v = u16::from_le_bytes([b[0], b[1]])
+        && v > 0
+    {
+        doc.settings.default_tab = f32::from(v) / 20.0;
+    }
     if let Some(core) = metadata::read(&comp) {
         doc.core = core;
     }
