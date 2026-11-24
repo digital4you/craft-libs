@@ -801,26 +801,41 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                 // Only table marks keep their table context; a plain paragraph would carry
                 // a `RowInfo` (about 300 bytes) it never uses.
                 let row = row.is_table().then(|| Box::new(row));
-                let mut ilvl = 0u8;
-                let mut ilfo = 0i32;
+                let mut ilvl: Option<u8> = None;
+                let mut ilfo: Option<i32> = None;
                 for prl in sprm::iter(papx) {
                     if prl.op == P_ILVL {
-                        ilvl = prl.operand.first().copied().unwrap_or(0).min(8);
+                        ilvl = Some(prl.operand.first().copied().unwrap_or(0).min(8));
                         continue;
                     }
                     if prl.op == P_ILFO {
-                        ilfo = match prl.operand {
+                        ilfo = Some(match prl.operand {
                             [b0, b1, ..] => i16::from_le_bytes([*b0, *b1]) as i32,
                             _ => 0,
-                        };
+                        });
                         continue;
                     }
                     if prl.sgc() == 1 {
                         fmt::apply_para(&mut pb.props, &prl);
                     }
                 }
-                if let Some(num) = num_of(ilfo) {
-                    pb.props.numbering = Some(NumRef { num, level: ilvl });
+                // The paragraph's own list, else its style's list ([MS-DOC] §2.6.2): a level of its
+                // own applies to the style's list, and an explicit "no list" (0 or 0xF801) ends
+                // the style's.
+                let style_num = pb.props.style.as_deref().and_then(|id| ctx.sheet.get(id)).and_then(|s| s.para.numbering);
+                match ilfo {
+                    Some(f) => match num_of(f) {
+                        Some(num) => pb.props.numbering = Some(NumRef { num, level: ilvl.unwrap_or(0) }),
+                        None if style_num.is_some() => pb.props.numbering = Some(NumRef { num: 0, level: 0 }),
+                        None => {}
+                    },
+                    None => {
+                        if let (Some(level), Some(s)) = (ilvl, style_num)
+                            && level != s.level
+                        {
+                            pb.props.numbering = Some(NumRef { num: s.num, level });
+                        }
+                    }
                 }
                 fmt::settle_frame(&mut pb.props);
                 let fc = ctx.pieces.fc_of_cp(cp).unwrap_or(0);

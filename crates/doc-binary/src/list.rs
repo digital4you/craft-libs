@@ -262,7 +262,9 @@ fn level_of(l: &RawLvl, lvl_index: usize, fonts: &[String]) -> Level {
             text.push(bullet_char(c));
         }
     }
-    if text.is_empty() {
+    // An empty number text shows nothing ([MS-DOC] §2.9.150 LVL.xst); only a bullet level
+    // (nfc 0x17) without its character falls back to a round bullet.
+    if text.is_empty() && l.nfc == 0x17 {
         text.push('\u{2022}');
     }
     // Indents from the level's grpprlPapx.

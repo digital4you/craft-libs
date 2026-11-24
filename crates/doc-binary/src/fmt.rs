@@ -80,15 +80,18 @@ const ICO: [Rgb; 17] = [
     Rgb(192, 192, 192),
 ];
 
-/// Highlight palette ([MS-DOC] §2.9.135 Highlight, order of Word's highlighter row).
+/// Highlight colours by `Ico` ([MS-DOC] §2.9.119: sprmCHighlight's operand is an Ico, 0 being no
+/// highlight), the order the writer's `highlight_ico` uses.
 const HL: [Highlight; 17] = [
     Highlight::None,
-    Highlight::Yellow,
-    Highlight::BrightGreen,
-    Highlight::Turquoise,
-    Highlight::Pink,
+    Highlight::Black,
     Highlight::Blue,
+    Highlight::Turquoise,
+    Highlight::BrightGreen,
+    Highlight::Pink,
     Highlight::Red,
+    Highlight::Yellow,
+    Highlight::White,
     Highlight::DarkBlue,
     Highlight::Teal,
     Highlight::Green,
@@ -97,8 +100,6 @@ const HL: [Highlight; 17] = [
     Highlight::DarkYellow,
     Highlight::Gray50,
     Highlight::Gray25,
-    Highlight::None,
-    Highlight::None,
 ];
 
 /// The `Ico` palette colour (0 = automatic → `None`).
@@ -681,9 +682,26 @@ fn apply_chain(chr: &mut CharProps, grpprl: &[u8], fonts: &[String]) {
 
 /// Apply a grpprl of paragraph sprms.
 fn apply_chain_para(para: &mut ParaProps, grpprl: &[u8]) {
+    // A style's list ([MS-DOC] §2.6.2 sprmPIlfo, sprmPIlvl): Word numbers headings this way
+    // ("1", "1.1"); a base style's list carries over unless this style sets its own.
+    let mut level: Option<u8> = None;
     for prl in sprm::iter(grpprl) {
-        if prl.sgc() == 1 {
-            apply_para(para, &prl);
+        match prl.op {
+            0x460B => {
+                let ilfo = u16_of(&prl).map_or(0, |v| v as i16 as i32);
+                para.numbering = match ilfo {
+                    0x0001..=0x07FE | -0x07FE..=-1 => {
+                        Some(craft_wordmodel::props::NumRef { num: ilfo.unsigned_abs(), level: para.numbering.as_ref().map_or(0, |n| n.level) })
+                    }
+                    _ => None,
+                };
+            }
+            0x260A => level = Some(prl.operand.first().copied().unwrap_or(0).min(8)),
+            _ if prl.sgc() == 1 => apply_para(para, &prl),
+            _ => {}
         }
+    }
+    if let (Some(l), Some(n)) = (level, para.numbering.as_mut()) {
+        n.level = l;
     }
 }
