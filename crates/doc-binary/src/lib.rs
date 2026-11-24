@@ -1084,6 +1084,19 @@ fn finish_field(pb: &mut ParaBuild, f: FieldBuild, work: &Work) {
         }
         return;
     }
+    // A result whose tracked insertions or deletions are not the field's own (an updated page
+    // number keeps the old one as deleted text) is written as a range field, so each run keeps
+    // its revision mark; one field object would hold the inserted and the deleted text as a
+    // single result.
+    if result.runs.iter().any(|(_, p)| (p.ins, p.del) != (f.anchor.ins, f.anchor.del)) {
+        let anchor = f.anchor.clone();
+        let f = FieldBuild { sep: Some(result), ..f };
+        // Not a hyperlink (handled above), so there is no link target to carry on.
+        open_range(pb, f, work);
+        pb.push('\u{FFFC}', anchor);
+        pb.objects.push(InlineObject::FieldEnd);
+        return;
+    }
     pb.push('\u{FFFC}', f.anchor);
     pb.objects.push(InlineObject::Field { instr, result: result.text, locked: false, dirty: false, code: false, form: String::new() });
 }
