@@ -168,6 +168,8 @@ const C_SYMBOL: u16 = 0x6A09;
 /// `sprmPIlvl` / `sprmPIlfo`: the paragraph's list level and list.
 const P_ILVL: u16 = 0x260A;
 const P_ILFO: u16 = 0x460B;
+/// `sprmPIstd`: the paragraph's style.
+const P_ISTD: u16 = 0x4600;
 
 /// Errors from reading a Word 97-2003 binary file.
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
@@ -797,6 +799,13 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                     combined = v;
                     &combined
                 };
+                // sprmPIstd in the grpprl names the paragraph's style in place of the PAPX's istd
+                // ([MS-DOC] sprmPIstd), as Word writes it after a tracked formatting change.
+                let istd = sprm::iter(papx)
+                    .filter(|p| p.op == P_ISTD)
+                    .filter_map(|p| p.operand.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]])))
+                    .last()
+                    .unwrap_or(istd);
                 if let Some(st) = ctx.raw_styles.get(istd as usize).filter(|s| !s.name.is_empty()) {
                     pb.props.style = Some(fmt::style_id(&st.name));
                 }
