@@ -100,6 +100,11 @@ impl Writer<'_> {
             }
             w.close("w:pPr");
         }
+        // Where the file read last had a page start, for readers that go by it (Word rewrites it
+        // when it lays the document out again).
+        if p.rendered_page_break {
+            w.raw("<w:r><w:lastRenderedPageBreak/></w:r>");
+        }
         // A note's first paragraph starts with its reference mark. When the paragraph holds the
         // note's reference to itself (notes read from a file, or made by references.footnote),
         // the mark is written there instead, with that reference's formatting.

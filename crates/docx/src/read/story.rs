@@ -125,6 +125,8 @@ struct PB {
     text: String,
     runs: Vec<Run>,
     objects: Vec<InlineObject>,
+    /// A `w:lastRenderedPageBreak` was read ([`Paragraph::rendered_page_break`]).
+    rendered_page_break: bool,
 }
 
 impl PB {

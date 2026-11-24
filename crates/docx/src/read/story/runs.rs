@@ -204,6 +204,8 @@ impl Reader<'_> {
                 }
             }
             "w:tab" => self.emit_text(sc, pb, "\t", props),
+            // Where a page started when the file was last laid out: no text, only a record.
+            "w:lastRenderedPageBreak" => pb.rendered_page_break = true,
             // Alignment and base are required (ECMA-376 §17.3.3.23); without them it stays a plain tab.
             "w:ptab" => match (k.attr("w:alignment").and_then(PTabAlign::from_ooxml), k.attr("w:relativeTo").and_then(PTabBase::from_ooxml)) {
                 (Some(align), Some(relative_to)) => {

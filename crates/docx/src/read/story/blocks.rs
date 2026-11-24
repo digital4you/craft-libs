@@ -272,6 +272,7 @@ impl Reader<'_> {
         para.text = pb.text;
         para.runs = pb.runs;
         para.objects = pb.objects;
+        para.rendered_page_break = pb.rendered_page_break;
         // Paragraph boundaries inside an instruction are hidden with the field code.
         // The result paragraph still takes a line, even when its cached text is empty.
         if sc.fields.iter().any(|f| f.phase == Phase::Instr) && para.plain_text().is_empty() {
