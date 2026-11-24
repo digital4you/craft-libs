@@ -59,6 +59,8 @@ const P_BRC_LEFT80: u16 = 0x6425;
 const P_BRC_BOTTOM80: u16 = 0x6426;
 const P_BRC_RIGHT80: u16 = 0x6427;
 const P_BRC_BETWEEN80: u16 = 0x6428;
+const P_SHD80: u16 = 0x442D;
+const P_SHD: u16 = 0xC64D;
 const P_BRC_TOP: u16 = 0xC64E;
 const P_BRC_LEFT: u16 = 0xC64F;
 const P_BRC_BOTTOM: u16 = 0xC650;
@@ -146,6 +148,49 @@ fn brc_style(t: u8) -> BorderStyle {
 /// reads (1-point steps for page borders, which never reach a paragraph property).
 fn brc_width(t: u8, dpt: u8) -> f32 {
     if t >= 0x40 { f32::from(dpt) } else { (f32::from(dpt.max(2)) / 8.0).min(12.0) }
+}
+
+/// The fill a shading shows: solid (ipat 1) the foreground, clear (0) the background, and the
+/// percentage patterns (ipat 2-13: 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90 %) the
+/// foreground over the background in that proportion, as they look from a distance
+/// ([MS-DOC] Ipat). Automatic colours are black in front and white behind; an automatic
+/// background with clear shows no fill. Other patterns (stripes, crosses) show the background.
+pub(crate) fn shading_fill(fore: Option<Rgb>, back: Option<Rgb>, ipat: u16) -> Option<Rgb> {
+    const PCT: [u8; 12] = [5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90];
+    let pct = match ipat {
+        1 => return Some(fore.unwrap_or(Rgb::BLACK)),
+        2..=13 => PCT[usize::from(ipat - 2)],
+        _ => return back,
+    };
+    let (f, b) = (fore.unwrap_or(Rgb::BLACK), back.unwrap_or(Rgb(255, 255, 255)));
+    let mix = |f: u8, b: u8| ((u16::from(f) * u16::from(pct) + u16::from(b) * u16::from(100 - pct) + 50) / 100) as u8;
+    Some(Rgb(mix(f.0, b.0), mix(f.1, b.1), mix(f.2, b.2)))
+}
+
+/// A 2-byte `Shd80` ([MS-DOC] Shd80: icoFore 5 bits, icoBack 5 bits, ipat 6 bits); ico 0 is
+/// automatic, and all of icoFore and icoBack set (0x1F) is nil.
+pub(crate) fn shd80(v: u16) -> Option<Rgb> {
+    let (fore, back, ipat) = (v & 0x1F, (v >> 5) & 0x1F, v >> 10);
+    if fore == 0x1F && back == 0x1F {
+        return None;
+    }
+    let ico = |i: u16| if i == 0 { None } else { ico(i as u8) };
+    shading_fill(ico(fore), ico(back), ipat)
+}
+
+/// A 10-byte `Shd` ([MS-DOC] Shd: cvFore, cvBack, ipat); a COLORREF with fAuto set is
+/// automatic, and ipat 0xFFFF is nil.
+pub(crate) fn shd(b: &[u8]) -> Option<Rgb> {
+    let cv = |b: &[u8]| match b {
+        [_, _, _, 0xFF] => None,
+        [r, g, bl, _] => Some(Rgb(*r, *g, *bl)),
+        _ => None,
+    };
+    let ipat = b.get(8..10).map(|x| u16::from_le_bytes([x[0], x[1]]))?;
+    if ipat == 0xFFFF {
+        return None;
+    }
+    shading_fill(cv(b.get(0..4)?), cv(b.get(4..8)?), ipat)
 }
 
 /// One border from a Brc80 operand ([MS-DOC] §2.9.18). All bits set means "no border"; a
@@ -581,6 +626,9 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 set_border(p, prl.op, b);
             }
         }
+        // Paragraph shading ([MS-DOC] sprmPShd80, sprmPShd: cb 10, then a Shd).
+        P_SHD80 => p.shading = u16_of(prl).and_then(shd80),
+        P_SHD => p.shading = prl.operand.get(1..11).and_then(shd),
         P_BRC_TOP | P_BRC_LEFT | P_BRC_BOTTOM | P_BRC_RIGHT | P_BRC_BETWEEN => {
             if let Some(b) = brc(prl.operand) {
                 set_border(p, prl.op, b);

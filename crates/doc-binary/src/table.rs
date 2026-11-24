@@ -692,37 +692,14 @@ fn table_borders(operand: &[u8]) -> Option<Borders> {
     Some(Borders { top: b(0), left: b(1), bottom: b(2), right: b(3), between: b(4), inside_v: b(5) })
 }
 
-/// Background colour from a 10-byte `Shd`: cvFore, cvBack (COLORREFs), ipat. Solid patterns
-/// show the foreground; clear (0) and the other patterns show the background (Word writes a
-/// plain cell fill as clear with cvBack); nil (0xFFFF) and automatic colours are no fill.
+/// Background colour from a 10-byte `Shd` ([`fmt::shd`]: patterns mixed as they look).
 fn shd_rgb(b: &[u8]) -> Option<Rgb> {
-    let cv = |b: &[u8]| -> Option<Rgb> {
-        match b {
-            [_, _, _, 0xFF] => None, // fAuto
-            [r, g, bl, _] => Some(Rgb(*r, *g, *bl)),
-            _ => None,
-        }
-    };
-    let ipat = b.get(8..10).map(|x| u16::from_le_bytes([x[0], x[1]]))?;
-    match ipat {
-        0xFFFF => None,
-        1 => cv(b.get(0..4)?),
-        _ => cv(b.get(4..8)?),
-    }
+    fmt::shd(b)
 }
 
-/// Background colour from a 2-byte `Shd80` (icoFore, icoBack, ipat bit-fields). As in
-/// [`shd_rgb`], solid shows the foreground and clear (0) the background, which is how Word
-/// 97 writes a plain fill; ico 0 is automatic (no fill).
+/// Background colour from a 2-byte `Shd80` ([`fmt::shd80`]).
 fn shd80_rgb(b: &[u8]) -> Option<Rgb> {
-    let v = u16::from_le_bytes([*b.first()?, *b.get(1)?]);
-    let fore = v & 0x1F;
-    let back = (v >> 5) & 0x1F;
-    let ipat = v >> 10;
-    if fore == 0x1F && back == 0x1F {
-        return None;
-    }
-    fmt::ico(if ipat == 1 { fore as u8 } else { back as u8 })
+    fmt::shd80(u16::from_le_bytes([*b.first()?, *b.get(1)?]))
 }
 
 fn u16_of(p: &Prl) -> Option<u16> {
