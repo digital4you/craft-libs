@@ -47,35 +47,41 @@ pub(crate) fn parse(word: &[u8], table: &[u8], fib: &Fib) -> Vec<Section> {
         let Some(end_cp) = cp_at(i + 1) else { break };
         let sed_at = (n + 1) * 4 + i * 12;
         let fc_sepx = plc.get(sed_at + 2..sed_at + 6).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0xFFFF_FFFF);
-        let mut props = SectionProps::default();
         // Sepx: cb u16, then a grpprl of section sprms.
-        let mut explicit_orient = false;
-        if let Some(grpprl) =
-            word.get(fc_sepx as usize..).and_then(|sepx| sepx.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)).and_then(|cb| {
-                let at = (fc_sepx as usize).checked_add(2)?;
-                word.get(at..at.checked_add(cb)?)
-            })
-        {
-            for prl in sprm::iter(grpprl) {
-                // Only a defined operand counts as explicit; anything else leaves the
-                // orientation to the page shape.
-                if prl.op == S_ORIENTATION && matches!(prl.operand.first(), Some(1 | 2)) {
-                    explicit_orient = true;
-                }
-                apply_section(&mut props, &prl);
-            }
-        }
-        // Without an explicit orientation sprm, infer it from the page shape.
-        if !explicit_orient {
-            if props.page_w < props.page_h {
-                props.landscape = false;
-            } else if props.page_w > props.page_h {
-                props.landscape = true;
-            }
-        }
+        let props = from_grpprl(sepx(word, fc_sepx).unwrap_or_default());
         out.push(Section { end_cp, props });
     }
     out
+}
+
+/// The grpprl of the Sepx at `fc_sepx` in the WordDocument stream: cb u16, then cb bytes.
+pub(crate) fn sepx(word: &[u8], fc_sepx: u32) -> Option<&[u8]> {
+    let cb = word.get(fc_sepx as usize..)?.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)?;
+    let at = (fc_sepx as usize).checked_add(2)?;
+    word.get(at..at.checked_add(cb)?)
+}
+
+/// A section's properties from its (Word 97) section sprms.
+pub(crate) fn from_grpprl(grpprl: &[u8]) -> SectionProps {
+    let mut props = SectionProps::default();
+    let mut explicit_orient = false;
+    for prl in sprm::iter(grpprl) {
+        // Only a defined operand counts as explicit; anything else leaves the
+        // orientation to the page shape.
+        if prl.op == S_ORIENTATION && matches!(prl.operand.first(), Some(1 | 2)) {
+            explicit_orient = true;
+        }
+        apply_section(&mut props, &prl);
+    }
+    // Without an explicit orientation sprm, infer it from the page shape.
+    if !explicit_orient {
+        if props.page_w < props.page_h {
+            props.landscape = false;
+        } else if props.page_w > props.page_h {
+            props.landscape = true;
+        }
+    }
+    props
 }
 
 /// Apply a section sprm to the model's section properties. All the measurement sprms here

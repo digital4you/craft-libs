@@ -72,6 +72,8 @@ const OFF_PAIRS: usize = 0x58;
 /// Pairs read: up to and including the piece table's.
 const PAIRS: usize = 34;
 const PAIR_STSH: usize = 1;
+/// The section table (`PlcfSed`), as in Word 97.
+const PAIR_SED: usize = 6;
 const PAIR_BTE_CHPX: usize = 12;
 const PAIR_BTE_PAPX: usize = 13;
 const PAIR_FONTS: usize = 15;
@@ -169,7 +171,15 @@ mod w97 {
 
 /// Is this WordDocument stream a Word 6.0/95 one?
 pub(crate) fn is_word6(word: &[u8]) -> bool {
-    word.get(0..2) == Some(&W_IDENT.to_le_bytes()[..])
+    // Word 6.0/95 writes wIdent 0xA5DC; some localized builds (a Traditional Chinese Word 95
+    // file has 0xA699) write another value with a Word 6.0/95 nFib (0x0065-0x00BF). Word 97's
+    // own wIdent (0xA5EC) always means the Word 97 layout.
+    let u16_at = |at: usize| word.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    match (u16_at(0), u16_at(2)) {
+        (Some(W_IDENT), _) => true,
+        (Some(0xA5EC), _) | (None, _) | (_, None) => false,
+        (Some(_), Some(n_fib)) => (0x0065..0x00C0).contains(&n_fib),
+    }
 }
 
 /// The fields of a Word 6.0/95 FIB that are read.
@@ -258,11 +268,21 @@ pub(crate) fn content(word: &[u8], fib: &Fib6) -> Result<Content, DocbinError> {
         // Not a code page: bytes above ASCII read as U+FFFD.
         _ => 0,
     };
-    let code_pages = if windows { code_page_runs(&chp_runs, &pap_runs, &facts, &fonts, default_code_page) } else { Vec::new() };
+    let mut code_pages = if windows { code_page_runs(&chp_runs, &pap_runs, &facts, &fonts, default_code_page) } else { Vec::new() };
+    // Writers other than Word (LibreOffice's Word 6/95 export among them) tag fonts with an East
+    // Asian charset whatever the text is. A stretch of plain ASCII bytes reads the same in any of
+    // these code pages, so it is read in the document's default page; only stretches that
+    // really hold lead bytes keep the East Asian page (and are refused below).
+    let ascii = |lo: u32, hi: u32| word.get(lo as usize..(hi as usize).min(word.len())).is_none_or(|b| b.iter().all(|&x| x < 0x80));
+    let default_code_page = if craft_codepage::is_multibyte_code_page(default_code_page) && !fib.wide && ascii(fib.fc_min, fib.fc_mac) { 1252 } else { default_code_page };
+    if !fib.wide {
+        code_pages.retain(|r| !(craft_codepage::is_multibyte_code_page(r.code_page) && ascii(r.lo, r.hi)) && r.code_page != default_code_page);
+    }
     // shortcut: East Asian (lead and trail byte) text is refused, as all Word 6.0/95 files were
     // before; read it a character at a time when the piece walk can decode byte pairs.
     let east_asian = || DocbinError::NotWord("Word 6.0/95 text in an East Asian code page is not read yet".into());
-    if craft_codepage::is_multibyte_code_page(default_code_page) || code_pages.iter().any(|r| craft_codepage::is_multibyte_code_page(r.code_page)) {
+    // UTF-16 text (fExtChar) needs no code page.
+    if !fib.wide && (craft_codepage::is_multibyte_code_page(default_code_page) || code_pages.iter().any(|r| craft_codepage::is_multibyte_code_page(r.code_page))) {
         return Err(east_asian());
     }
     let multibyte_piece = std::cell::Cell::new(false);
@@ -314,7 +334,7 @@ fn font_code_page(fonts: &[Font], font: u16) -> Option<u16> {
 /// Windows' ANSI code page for the language `lid` (an LCID), which Word uses for 8-bit text in a
 /// font without a charset of its own. Russian (1251) and English (1252) were checked against Word;
 /// the rest is the standard Windows assignment.
-fn lid_code_page(lid: u16) -> u16 {
+pub(crate) fn lid_code_page(lid: u16) -> u16 {
     match lid & 0x03FF {
         // Serbian in Cyrillic (0x0C1A, 0x1C1A); Croatian and Serbian in Latin otherwise.
         0x1A => match lid {
@@ -655,6 +675,77 @@ fn sprms(grpprl: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
         rest = after.get(len..).unwrap_or_default();
         Some((op, operand))
     })
+}
+
+/// The sections of a Word 6.0/95 file: (end CP, properties). The section table has the Word 97
+/// layout (CPs, then 12-byte SEDs whose fcSepx points into the WordDocument stream), and a Sepx
+/// is a u16 size and a grpprl of 1-byte section sprms, translated here to their Word 97 opcodes.
+pub(crate) fn sections(word: &[u8], fib: &Fib6) -> Vec<(u32, craft_wordmodel::section::SectionProps)> {
+    let Some((fc, lcb)) = fib.pair(PAIR_SED) else { return Vec::new() };
+    let Some(plc) = word.get(fc as usize..(fc as usize).saturating_add(lcb as usize)) else { return Vec::new() };
+    if plc.len() < 4 || (plc.len() - 4) % 16 != 0 {
+        return Vec::new();
+    }
+    let n = ((plc.len() - 4) / 16).min(MAX_SECTIONS);
+    let u32_at = |at: usize| plc.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(end) = u32_at((i + 1) * 4) else { break };
+        let fc_sepx = u32_at((((plc.len() - 4) / 16) + 1) * 4 + i * 12 + 2).unwrap_or(u32::MAX);
+        let grpprl = if fc_sepx == u32::MAX { &[][..] } else { crate::sections::sepx(word, fc_sepx).unwrap_or_default() };
+        out.push((end, crate::sections::from_grpprl(&translate_sep(grpprl))));
+    }
+    out
+}
+
+/// Most sections read from a Word 6.0/95 file.
+const MAX_SECTIONS: usize = 10_000;
+
+/// A Word 6.0/95 Sepx grpprl as the Word 97 section sprms it stands for. The operand sizes and
+/// the opcode correspondence follow docboss (crates/docboss-doc/src/word6.rs, MIT OR
+/// Apache-2.0); a code of unknown size ends the walk.
+fn translate_sep(grpprl: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(&code) = grpprl.get(at) {
+        let len = match code {
+            131 | 132 | 138 | 139 | 142 | 143 | 146 | 147 | 150..=153 | 158 | 159 | 162 | 163 => 1,
+            140 | 141 | 144 | 145 | 148 | 149 | 154..=157 | 160 | 161 | 164..=171 => 2,
+            136 | 137 => 3,
+            133 => 1 + usize::from(grpprl.get(at + 1).copied().unwrap_or(0)),
+            _ => break,
+        };
+        let Some(v) = grpprl.get(at + 1..at + 1 + len) else { break };
+        let op: Option<u16> = match code {
+            136 => Some(0xF203),
+            137 => Some(0xF204),
+            138 => Some(0x3005),
+            142 => Some(0x3009),
+            143 => Some(0x300A),
+            144 => Some(0x500B),
+            145 => Some(0x900C),
+            147 => Some(0x300E),
+            150 => Some(0x3011),
+            156 => Some(0xB017),
+            157 => Some(0xB018),
+            158 => Some(0x3019),
+            161 => Some(0x501C),
+            162 => Some(0x301D),
+            164 => Some(0xB01F),
+            165 => Some(0xB020),
+            166 => Some(0xB021),
+            167 => Some(0xB022),
+            168 => Some(0x9023),
+            169 => Some(0x9024),
+            170 => Some(0xB025),
+            _ => None,
+        };
+        if let Some(op) = op {
+            prl(&mut out, op, v);
+        }
+        at += 1 + len;
+    }
+    out
 }
 
 /// Append a Word 97 Prl: opcode, then operand.

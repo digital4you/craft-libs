@@ -34,6 +34,7 @@ mod sections;
 mod sprm;
 mod stsh;
 mod table;
+mod word2;
 mod word6;
 mod write;
 
@@ -194,6 +195,9 @@ pub enum DocbinError {
     Malformed(String),
 }
 
+/// Is this a Word for Windows 2.0 file (no compound file), which [`read`] reads as text?
+pub use word2::is_word2;
+
 /// Is this `.doc` password-protected (XOR obfuscation, RC4 or RC4 CryptoAPI)? False for
 /// anything that is not a readable Word 97-2003 file.
 pub fn is_encrypted(bytes: &[u8]) -> bool {
@@ -224,13 +228,16 @@ pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Docume
 /// [`read_with_password`] with the paragraph cap as a parameter, so tests need not build a
 /// file of [`MAX_PARAGRAPHS`] marks.
 fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> Result<Document, DocbinError> {
+    if word2::is_word2(bytes) {
+        return word2::read(bytes, max_paragraphs);
+    }
     let comp = open_container(bytes)?;
     let mut word = stream(&comp, "WordDocument")?.ok_or_else(|| DocbinError::NotWord("no WordDocument stream".into()))?;
     if word.len() as u64 > MAX_STREAM {
         return Err(DocbinError::Limit(format!("WordDocument stream is {} bytes", word.len())));
     }
     if word6::is_word6(&word) {
-        return read_word6(&comp, &word, max_paragraphs);
+        return read_word6(Some(&comp), &word, max_paragraphs);
     }
     let enc = fib::peek_encryption(&word);
     // The FIB names the Table stream (0Table or 1Table); fall back to whichever exists,
@@ -450,13 +457,13 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
 /// formatting and table rows translated to Word 97 sprms, through the same walk as a Word 97 file.
 /// Its paragraph styles are read too; character styles and the other stories are not yet, and a
 /// section mark reads as a page break.
-fn read_word6(comp: &craft_cfb::CompoundFile<'_>, word: &[u8], max_paragraphs: usize) -> Result<Document, DocbinError> {
+fn read_word6(comp: Option<&craft_cfb::CompoundFile<'_>>, word: &[u8], max_paragraphs: usize) -> Result<Document, DocbinError> {
     let fib = word6::Fib6::parse(word)?;
     let content = word6::content(word, &fib)?;
     let mut doc = Document::new();
     // Word opens these files in compatibility mode 11 too.
     doc.settings.compat_mode = 11;
-    if let Some(core) = metadata::read(comp) {
+    if let Some(core) = comp.and_then(metadata::read) {
         doc.core = core;
     }
     doc.body.clear();
@@ -487,9 +494,27 @@ fn read_word6(comp: &craft_cfb::CompoundFile<'_>, word: &[u8], max_paragraphs: u
         work: &work,
         revs: &revs,
     };
-    let paras = walk(&ctx, 0, fib.ccp_text, &mut pics);
+    // Sections: each one's properties go on the paragraph its section mark ends, the last
+    // section's on the document, as for Word 97 files.
+    let sects = word6::sections(word, &fib);
+    let mut sect_ends: Vec<u32> = sects.iter().map(|(end, _)| *end).collect();
+    sect_ends.sort_unstable();
+    let ctx = WalkCtx { sect_ends: &sect_ends, ..ctx };
+    let mut paras = walk(&ctx, 0, fib.ccp_text, &mut pics);
     if paragraphs.exceeded.get() {
         return Err(paragraph_limit(max_paragraphs));
+    }
+    if let Some((_, last)) = sects.last() {
+        doc.last_section = last.clone();
+    }
+    for (si, (end, props)) in sects.iter().enumerate() {
+        if si + 1 == sects.len() || *end >= fib.ccp_text {
+            continue;
+        }
+        let at = paras.partition_point(|p| p.end_cp < *end);
+        if let Some(p) = paras.get_mut(at).filter(|p| p.end_cp == *end) {
+            p.para.section = Some(Box::new(props.clone()));
+        }
     }
     doc.body = table::assemble(paras);
     doc.ensure_nonempty();
