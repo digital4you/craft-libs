@@ -389,9 +389,11 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
     let mut out: Blocks = Vec::new();
     while let Some(next) = it.peek() {
         if level_of(next) > 0 {
-            if let Some(t) = table(&mut it, 1) {
+            let (t, rest) = table(&mut it, 1);
+            if let Some(t) = t {
                 out.push(Arc::new(Block::Table(t)));
             }
+            out.extend(rest);
             continue;
         }
         if let Some(mut p) = it.next() {
@@ -431,8 +433,10 @@ fn flush_cell(cells: &mut Vec<Cell>, cell: &mut Blocks) {
 }
 
 /// The table at `level`: cells end at that level's cell marks, rows at its row marks, and
-/// deeper marks form tables nested in the current cell.
-fn table(it: &mut std::iter::Peekable<std::vec::IntoIter<ParaOut>>, level: u32) -> Option<Table> {
+/// deeper marks form tables nested in the current cell. In-table paragraphs after the last row
+/// mark belong to no row ([MS-DOC] §2.4.3: a row ends at its TTP mark); they are returned as the
+/// paragraphs they are, to follow the table, as Word and LibreOffice show them.
+fn table(it: &mut std::iter::Peekable<std::vec::IntoIter<ParaOut>>, level: u32) -> (Option<Table>, Blocks) {
     let mut rows: Vec<(Vec<Cell>, Box<RowInfo>)> = Vec::new();
     let mut cells: Vec<Cell> = Vec::new();
     let mut cell: Blocks = Vec::new();
@@ -442,9 +446,11 @@ fn table(it: &mut std::iter::Peekable<std::vec::IntoIter<ParaOut>>, level: u32) 
             break;
         }
         if l > level {
-            if let Some(t) = table(it, level + 1) {
+            let (t, rest) = table(it, level + 1);
+            if let Some(t) = t {
                 cell.push(Arc::new(Block::Table(t)));
             }
+            cell.extend(rest);
             continue;
         }
         let Some(p) = it.next() else { break };
@@ -471,21 +477,12 @@ fn table(it: &mut std::iter::Peekable<std::vec::IntoIter<ParaOut>>, level: u32) 
             flush_cell(&mut cells, &mut cell);
         }
     }
-    if !cell.is_empty() {
-        flush_cell(&mut cells, &mut cell);
-    }
-    if !cells.is_empty() {
-        // A stray trailing row (no row mark of its own): sized from the previous row's edges.
-        let mut stray = Box::new(RowInfo::default());
-        if let Some((_, last)) = rows.last() {
-            stray.edges = last.edges.clone();
-        }
-        rows.push((cells, stray));
-    }
+    let mut rest: Blocks = cells.into_iter().flat_map(|c| c.blocks).collect();
+    rest.extend(cell);
     if rows.is_empty() {
-        return None;
+        return (None, rest);
     }
-    Some(build_table(rows))
+    (Some(build_table(rows)), rest)
 }
 
 /// A table from its rows: the grid from every row's cell edges, each cell's span over it, the
