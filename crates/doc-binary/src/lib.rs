@@ -1111,7 +1111,9 @@ fn finish_field(pb: &mut ParaBuild, f: FieldBuild, work: &Work) {
     // number keeps the old one as deleted text) is written as a range field, so each run keeps
     // its revision mark; one field object would hold the inserted and the deleted text as a
     // single result.
-    if result.runs.iter().any(|(_, p)| (p.ins, p.del) != (f.anchor.ins, f.anchor.del)) {
+    // So is a result in more than one format: Word shows the result as its runs are formatted,
+    // and one field object has one format.
+    if result.runs.len() > 1 || result.runs.iter().any(|(_, p)| (p.ins, p.del) != (f.anchor.ins, f.anchor.del)) {
         let anchor = f.anchor.clone();
         let f = FieldBuild { sep: Some(result), ..f };
         // Not a hyperlink (handled above), so there is no link target to carry on.
@@ -1120,7 +1122,10 @@ fn finish_field(pb: &mut ParaBuild, f: FieldBuild, work: &Work) {
         pb.objects.push(InlineObject::FieldEnd);
         return;
     }
-    pb.push('\u{FFFC}', f.anchor);
+    // The object shows its result in the result's format (a FILENAME result in bold 22 pt), not
+    // in the field begin character's.
+    let props = result.runs.first().map_or(f.anchor, |(_, p)| p.clone());
+    pb.push('\u{FFFC}', props);
     pb.objects.push(InlineObject::Field { instr, result: result.text, locked: false, dirty: false, code: false, form: String::new() });
 }
 
