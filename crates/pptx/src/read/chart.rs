@@ -7,6 +7,10 @@ use craft_drawingml::chart::write::sidecar_part;
 
 pub(crate) use craft_drawingml::chart::read::MAX_PRESENTATION_CHART_POINTS;
 
+use craft_drawingml::MediaId;
+use craft_drawingml::part::{self, Source};
+use craft_xml::{El, Local};
+
 use crate::chart::Chart;
 
 /// The chart a graphic frame points at. A chart that would cross the presentation's point or
@@ -22,11 +26,13 @@ pub(crate) fn frame_chart(imp: &mut super::Imp, part: &super::Part, rid: &str, u
     }
     imp.chart_decode_bytes += bytes.len();
     let parsed = if imp.chart_points < imp.chart_points_cap {
-        let c = if chartex { read_chartex_xml(bytes) } else { read_chart_xml(bytes) }?;
+        let mut c = if chartex { read_chartex_xml(bytes) } else { read_chart_xml(bytes) }?;
+        if !chartex {
+            picture_fills(imp, &rel.target, bytes, &mut c);
+        }
         let n = point_count(&c);
         if imp.chart_points.saturating_add(n) <= imp.chart_points_cap {
             imp.chart_points = imp.chart_points.saturating_add(n);
-            let mut c = c;
             c.kept = capture_kept(imp, &rel.target);
             return Some(c);
         }
@@ -49,6 +55,48 @@ pub(crate) fn frame_chart(imp: &mut super::Imp, part: &super::Part, rid: &str, u
     c.verbatim = true;
     c.kept = capture_kept(imp, &rel.target);
     Some(c)
+}
+
+/// The chart area's and plot area's picture fills (`c:spPr/a:blipFill`). `read_chart_xml` reads
+/// the chart part without its relationships, so it cannot reach the image and skips the fill;
+/// it is read here with the chart part's relationships, the image added to the presentation's
+/// media.
+fn picture_fills(imp: &mut super::Imp, chart_part: &str, bytes: &[u8], c: &mut Chart) {
+    if !bytes.windows(8).any(|w| w == b"blipFill") {
+        return;
+    }
+    let Ok(mut root) = craft_drawingml::xmlx::parse(bytes) else { return };
+    craft_drawingml::xmlx::resolve_mc(&mut root);
+    let mut src = ChartSrc { rels: imp.pkg.rels(chart_part), imp };
+    fn blip_fill(sp_pr: Option<&El>) -> Option<&El> {
+        sp_pr?.child(Local("blipFill"))
+    }
+    if let Some(bf) = blip_fill(root.child(Local("spPr")))
+        && let Some(fill) = craft_drawingml::read::fill_el(&mut src, bf)
+    {
+        c.chart_fill = Some(fill);
+    }
+    let plot_area = root.child(Local("chart")).and_then(|ch| ch.child(Local("plotArea")));
+    if let Some(bf) = blip_fill(plot_area.and_then(|pa| pa.child(Local("spPr"))))
+        && let Some(fill) = craft_drawingml::read::fill_el(&mut src, bf)
+    {
+        c.plot_fill = Some(fill);
+    }
+}
+
+/// The chart part as the DrawingML readers see it: its own relationships, the presentation's media.
+struct ChartSrc<'s, 'a> {
+    imp: &'s mut super::Imp<'a>,
+    rels: craft_opc::Rels,
+}
+
+impl Source for ChartSrc<'_, '_> {
+    fn rel(&self, id: &str) -> Option<part::Rel> {
+        self.rels.by_id(id).map(|r| part::Rel { target: r.target.clone(), external: r.external })
+    }
+    fn media(&mut self, target: &str, external: bool) -> Option<MediaId> {
+        if external { Some(self.imp.media_link(target)) } else { self.imp.media_for(target) }
+    }
 }
 
 const MAX_KEPT_PARTS: usize = 256;
