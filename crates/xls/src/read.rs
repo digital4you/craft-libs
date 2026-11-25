@@ -813,7 +813,9 @@ fn worksheet<'g>(
     let mut recs = Records::new(stream, bs.pos);
     let first = recs.next_record()?.ok_or_else(|| invalid("missing sheet substream"))?;
     let (vers, dt) = bof(&first)?;
-    let same = if g.biff5 { vers & 0xFF00 == BIFF5 } else { vers == BIFF8 };
+    // The globals' version decides the record layout: Excel 97 saving as Excel 5.0/95 marks the
+    // worksheets of a BIFF5 stream with the BIFF8 version.
+    let same = if g.biff5 { vers & 0xFF00 == BIFF5 || vers == BIFF8 } else { vers == BIFF8 };
     if !same || dt != 0x0010 {
         return Ok(None);
     }
