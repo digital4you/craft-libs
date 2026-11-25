@@ -1,7 +1,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 //! Clean-room reader for Excel 97-2003 workbooks (`.xls`, BIFF8), written from Microsoft's
 //! public specifications **[MS-XLS]: Excel Binary File Format (.xls) Structure** (the Workbook
-//! stream) and [MS-CFB] (the compound file around it, read by `craft-cfb`).
+//! stream) and [MS-CFB] (the compound file around it, read by `craft-cfb`), and for Excel 5.0/95
+//! workbooks (BIFF5 and BIFF7) into the same model (see `biff5`).
 //!
 //! [`read`] gives a [`Workbook`]: the worksheets with their cells (values, cached formula
 //! results, and formulas as A1 text, including shared and array formulas), the cell formats
@@ -15,8 +16,10 @@
 //! Everything else (charts, other shapes, newer conditional formats, hyperlinks,
 //! PivotTables, macros) is skipped and named in [`Read::warnings`]. A workbook encrypted with
 //! RC4 or RC4 CryptoAPI is read with its password ([`read_with_password`]; without one, Excel's
-//! default password is tried and [`Error::Encrypted`] says one is needed). Other encryption and
-//! versions before BIFF8 are refused ([`Error::UnsupportedEncryption`], [`Error::Biff5`]). A formula that
+//! default password is tried and [`Error::Encrypted`] says one is needed). Other encryption,
+//! including Excel 5.0/95's XOR obfuscation, is refused ([`Error::UnsupportedEncryption`]), and
+//! so are versions before BIFF5 (Excel 2.x to 4.0 single-stream files are not compound files).
+//! A formula that
 //! cannot be put back into text (links to other workbooks, macro commands, unknown tokens)
 //! leaves its cell with the saved result and a [`Warning::FormulaKept`].
 //!
@@ -34,6 +37,7 @@
 //! # }
 //! ```
 
+mod biff5;
 mod cond;
 mod crypt;
 mod drawing;
@@ -62,8 +66,8 @@ pub use read::{is_encrypted, is_xls, read, read_with, read_with_password};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// Not a compound file, no Workbook stream, or a damaged stream.
-    #[error("not a readable Excel 97-2003 workbook: {0}")]
+    /// Not a compound file, no Workbook (or Book) stream, or a damaged stream.
+    #[error("not a readable Excel 97-2003 or 5.0/95 workbook: {0}")]
     Invalid(String),
     /// More than a [`Limits`] value or a fixed cap allows.
     #[error("the workbook is too large: {0}")]
@@ -79,9 +83,6 @@ pub enum Error {
     /// AES or another cipher or hash, an external provider), named.
     #[error("the workbook uses {0} encryption, which is not read")]
     UnsupportedEncryption(String),
-    /// An Excel 5.0/95 workbook (BIFF5), which is not read.
-    #[error("Excel 5.0/95 workbooks (BIFF5) are not supported")]
-    Biff5,
 }
 
 /// What a read skipped or repaired. Each distinct warning is reported once.

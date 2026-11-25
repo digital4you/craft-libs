@@ -1,4 +1,4 @@
-//! BIFF8 record framing ([MS-XLS] 2.1.4) and the string structures ([MS-XLS] 2.5.240,
+//! BIFF5 and BIFF8 record framing ([MS-XLS] 2.1.4) and the BIFF8 string structures ([MS-XLS] 2.5.240,
 //! 2.5.293, 2.5.294) that may continue across `Continue` records.
 
 use crate::Error;
@@ -157,6 +157,21 @@ impl<'a, 'b> Cursor<'a, 'b> {
             units.push(if high { self.u16()? } else { u16::from(self.u8()?) });
         }
         Ok(String::from_utf16_lossy(&units))
+    }
+
+    /// `n` raw bytes, crossing into `Continue` records without a flag byte (a BIFF5 byte string).
+    pub fn bytes(&mut self, n: usize) -> Result<Vec<u8>, Error> {
+        if n > MAX_CHARS {
+            return Err(Error::Invalid("string too long".into()));
+        }
+        if n > self.remaining() {
+            return Err(Error::Invalid("record is shorter than its contents".into()));
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.u8()?);
+        }
+        Ok(out)
     }
 
     /// ShortXLUnicodeString: 1-byte count, flags, characters.

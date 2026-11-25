@@ -207,14 +207,16 @@ fn refuses_encrypted_old_and_foreign_files() {
     stream.extend(rec(0x002F, &[1, 0, 1, 0]));
     stream.extend(eof());
     assert!(matches!(read_xls(&compound("Workbook", &stream)), Err(Error::Invalid(_))));
-    // A BIFF5 (Excel 5.0/95) workbook keeps its data in a `Book` stream.
+    // A BIFF5 (Excel 5.0/95) workbook keeps its data in a `Book` stream, which is read like a
+    // Workbook stream: this one is the damaged encrypted stream above.
     let book = compound("Book", &stream);
     assert!(is_xls(&book));
-    assert_eq!(read_xls(&book).err(), Some(Error::Biff5));
-    // So does one whose Workbook stream starts with a BIFF5 BOF.
+    assert!(matches!(read_xls(&book), Err(Error::Invalid(_))));
+    // A BIFF5 stream with a FILEPASS record is XOR-obfuscated, which is not read.
     let mut old = rec(0x0809, &u16s(&[0x0500, 0x0005, 0, 0]));
+    old.extend(rec(0x002F, &[1, 0, 1, 0]));
     old.extend(eof());
-    assert_eq!(read_xls(&compound("Workbook", &old)).err(), Some(Error::Biff5));
+    assert!(matches!(read_xls(&compound("Workbook", &old)), Err(Error::UnsupportedEncryption(_))));
     // Another compound file (a word processor document): not a workbook.
     let doc = compound("WordDocument", &[0u8; 100]);
     assert!(!is_xls(&doc));

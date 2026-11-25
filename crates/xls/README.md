@@ -1,17 +1,20 @@
 # craft-xls
 
-A clean-room reader for Excel 97-2003 workbooks (`.xls`, BIFF8). It turns the bytes of a file
+A clean-room reader for Excel 97-2003 workbooks (`.xls`, BIFF8), and for Excel 5.0/95 workbooks
+(BIFF5 and BIFF7) into the same model. It turns the bytes of a file
 into a `Workbook` that keeps the file's own terms: cells, formulas as text, the format table,
 column and row records. Mapping that onto an application's document is the caller's work.
 No `unsafe`. Dependencies: `craft-cfb` (the compound file container), `craft-sheet` (cell positions,
-values and tables shared with the other spreadsheet formats), `md-5` and `sha1` (RC4 keys),
-`miniz_oxide` (compressed metafiles) and `thiserror`.
+values and tables shared with the other spreadsheet formats), `craft-codepage` and `encoding_rs`
+(Excel 5.0/95 byte strings), `md-5` and `sha1` (RC4 keys), `miniz_oxide` (compressed metafiles)
+and `thiserror`.
 No third-party implementation was consulted.
 
 | Document | Used for |
 |---|---|
 | [MS-XLS] Excel Binary File Format (.xls) Structure (Microsoft Open Specifications) | the Workbook stream: record framing and Continue records, strings, the globals and worksheet substreams, cell records, parsed formulas (`Ptg` tokens, the `Ftab` function table), XF / Font / Palette / Style, defined names |
 | [MS-CFB] Compound File Binary File Format | the container, through `craft-cfb` |
+| Microsoft's Excel binary file format documentation and the OpenOffice.org documentation of the Excel file format | the BIFF5 differences: the `Book` stream, CodePage and byte strings, the older BoundSheet, Font, Format, XF, Style, Lbl, Label, RString, String, Note and Obj layouts, and BIFF5 formula tokens |
 
 ## What is read
 
@@ -51,8 +54,28 @@ conditional formats per sheet. A damaged comment, object or conditional-format r
 skipped with a warning.
 
 Not read: charts, other shapes, newer conditional formats (CF12), hyperlinks,
-PivotTables, macros. Each is named once in `Read::warnings`. BIFF5 and older is refused
-(`Error::Biff5`).
+PivotTables, macros. Each is named once in `Read::warnings`.
+
+## Excel 5.0/95 workbooks
+
+A BIFF5 or BIFF7 stream (`Book`, or a `Workbook` stream with a BIFF5 BOF; a file with both is
+read from `Workbook`) gives the same `Workbook`, as far as the format carries it: sheets with
+their names, order and visibility; numbers (Number, RK, MulRk), labels (Label, RString),
+booleans, errors, blanks; formulas as text with their saved results, including a string result
+from the String record, shared and array formulas; number formats; fonts, cell formats (the
+16-byte XF, rewritten into BIFF8's layout: alignment, wrap, the four orientations, fill pattern
+and colours, four borders without diagonals or indent) and named styles; the palette; ColInfo,
+Row and the default row height; Window1 and Window2; the 1904 flag and calculation settings;
+defined names, print areas and print titles; cell comments as Note text (no author). Strings are
+decoded in the CodePage record's code page (single-byte Windows, DOS and Mac pages through
+`craft-codepage`, 932, 936, 949 and 950 through `encoding_rs`; ASCII, 1200 and unknown pages as
+Windows-1252). Formula tokens are rewritten into BIFF8 tokens (shorter cell references, 3-D
+references against a link table of this workbook's sheets, byte-string constants) and decoded
+as BIFF8 ones; references to other workbooks and add-in functions keep their saved results.
+The format has no merged cells, conditional formats, data validation, hyperlinks or Escher
+drawings; its charts and pictures (Obj records) are named in the warnings. An XOR-obfuscated
+workbook is `Error::UnsupportedEncryption`. Excel 2.x to 4.0 files are single BIFF2-BIFF4
+streams, not compound files, and are not read.
 
 ## Encrypted workbooks
 

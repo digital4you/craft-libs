@@ -1,10 +1,12 @@
-//! Cell formatting in a BIFF8 Workbook stream, from [MS-XLS]: Font (2.4.122), XF (2.4.353) with
-//! CellXF (2.5.91), Palette (2.4.188) and Style (2.4.269). Every XF is
+//! Cell formatting in a Workbook stream, from [MS-XLS]: Font (2.4.122), XF (2.4.353) with
+//! CellXF (2.5.91), Palette (2.4.188) and Style (2.4.269); a BIFF5 XF is first rewritten into
+//! the BIFF8 layout (`biff5::xf`). Every XF is
 //! decoded on its own: a cell XF stores its complete formatting (the fAtr* bits only say whether
 //! later changes to the parent style propagate), so nothing is inherited from `ixfParent`.
 
 use std::collections::HashMap;
 
+use crate::biff5::CodePage;
 use crate::model::{
     Alignment, BorderLine, BorderStyle, Borders, CellFormat, Color, Fill, Font, HAlign, Pattern, Script, Underline, VAlign, Workbook,
 };
@@ -59,12 +61,13 @@ pub(crate) struct StyleRecords {
 }
 
 impl StyleRecords {
-    /// A Font record. The colour is resolved later, once the palette is known.
-    pub(crate) fn font(&mut self, c: &mut Cursor<'_, '_>) {
+    /// A Font record; `cp` for a BIFF5 one, whose name is a byte string. The colour is resolved
+    /// later, once the palette is known.
+    pub(crate) fn font(&mut self, c: &mut Cursor<'_, '_>, cp: Option<CodePage>) {
         if self.fonts.len() >= MAX_FONTS {
             return;
         }
-        match read_font(c) {
+        match read_font(c, cp) {
             Some((font, icv)) => {
                 self.fonts.push(font);
                 self.font_colors.push(icv);
@@ -112,6 +115,27 @@ impl StyleRecords {
         self.xfs.push(xf);
     }
 
+    /// A BIFF5 XF record, kept in the BIFF8 layout.
+    pub(crate) fn xf5(&mut self, rec: &[u8], max: usize) {
+        if self.xfs.len() >= max {
+            return;
+        }
+        let word = |i: usize| u16::from_le_bytes([rec.get(i).copied().unwrap_or(0), rec.get(i + 1).copied().unwrap_or(0)]);
+        let xf = match crate::biff5::xf(rec) {
+            Some(b) => {
+                let mut data = [0u8; 14];
+                data.copy_from_slice(b.get(6..).unwrap_or(&[0; 14]));
+                Xf { ifnt: word(0), ifmt: word(2), flags: word(4), data, complete: true }
+            }
+            None if rec.len() >= 6 => Xf { ifnt: word(0), ifmt: word(2), flags: word(4), ..Xf::default() },
+            None => Xf { flags: 1, ..Xf::default() },
+        };
+        if !xf.complete {
+            self.short = true;
+        }
+        self.xfs.push(xf);
+    }
+
     /// A Palette record: colours for indexes 8 onwards.
     pub(crate) fn palette(&mut self, c: &mut Cursor<'_, '_>) {
         let Ok(ccv) = c.u16() else {
@@ -130,8 +154,8 @@ impl StyleRecords {
         self.palette = Some(colors);
     }
 
-    /// A Style record.
-    pub(crate) fn style(&mut self, c: &mut Cursor<'_, '_>) {
+    /// A Style record; `cp` for a BIFF5 one, whose name is a byte string.
+    pub(crate) fn style(&mut self, c: &mut Cursor<'_, '_>, cp: Option<CodePage>) {
         if self.styles.len() >= MAX_STYLES {
             return;
         }
@@ -148,7 +172,11 @@ impl StyleRecords {
             // BuiltInStyle: the style's number (0 is Normal) and outline level.
             self.styles.push(NamedStyle { ixf, builtin: Some(id), name: String::new() });
         } else {
-            match c.string() {
+            let name = match cp {
+                None => c.string(),
+                Some(cp) => c.u8().and_then(|n| c.bytes(usize::from(n))).map(|b| cp.decode(&b)),
+            };
+            match name {
                 Ok(name) => {
                     let name: String = name.chars().filter(|ch| *ch != '\0').take(MAX_STYLE_NAME).collect();
                     if !name.is_empty() {
@@ -173,7 +201,7 @@ impl StyleRecords {
 }
 
 /// Font record fields up to the name; `None` if the record is too short for them.
-fn read_font(c: &mut Cursor<'_, '_>) -> Option<(Font, u16)> {
+fn read_font(c: &mut Cursor<'_, '_>, cp: Option<CodePage>) -> Option<(Font, u16)> {
     let height = c.u16().ok()?;
     let flags = c.u16().ok()?;
     let icv = c.u16().ok()?;
@@ -183,7 +211,13 @@ fn read_font(c: &mut Cursor<'_, '_>) -> Option<(Font, u16)> {
     let family = c.u8().ok()?;
     let charset = c.u8().ok()?;
     c.skip(1).ok()?; // reserved
-    let name = c.short_string().ok()?;
+    let name = match cp {
+        None => c.short_string().ok()?,
+        Some(cp) => {
+            let n = usize::from(c.u8().ok()?);
+            cp.decode(&c.bytes(n).ok()?)
+        }
+    };
     let mut f = Font::default();
     let name: String = name.chars().filter(|ch| *ch != '\0').take(255).collect();
     if !name.trim().is_empty() {
