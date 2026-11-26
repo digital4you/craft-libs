@@ -283,3 +283,55 @@ fn members_into(nodes: &[Node], t: (f32, f32, f32, f32), depth: usize, b: &Build
         }
     }
 }
+
+/// A Word 6.0/95 drawn object primitive as a floating shape, with the text box part ids by the
+/// index of their story. Drawn objects take no room from the text and lie behind it.
+pub(crate) fn word6_object(d: &crate::word6::Drawn6, textbox_parts: &[Option<u32>]) -> InlineObject {
+    use crate::word6::DrawnKind;
+    let tw = |v: i32| (v as f32 / 20.0).clamp(-2.0 * MAX_PT, 2.0 * MAX_PT);
+    let [x, y, dx, dy] = d.rect;
+    let anchor = |v: u8, along: Anchor| match v {
+        0 => Anchor::Margin,
+        1 => Anchor::Page,
+        _ => along,
+    };
+    // A line runs from its start to its end: the box is the one around both, flipped when the
+    // line falls from right to left.
+    let (x, y, w, h, flip) = if d.kind == DrawnKind::Line {
+        (tw(x.min(x + dx)), tw(y.min(y + dy)), tw(dx.abs()), tw(dy.abs()), (dx < 0) != (dy < 0))
+    } else {
+        (tw(x), tw(y), tw(dx.max(0)), tw(dy.max(0)), false)
+    };
+    let float = Float {
+        wrap: Wrap::BehindText,
+        h_rel: anchor(d.bx, Anchor::Column),
+        v_rel: anchor(d.by, Anchor::Paragraph),
+        x,
+        y,
+        dist: 0.0,
+        flip_h: flip,
+        ..Float::default()
+    };
+    let kind = match d.kind {
+        DrawnKind::Line => ShapeKind::Line,
+        DrawnKind::TextBox => ShapeKind::TextBox,
+        DrawnKind::Rect => ShapeKind::Rectangle,
+        DrawnKind::RoundRect => ShapeKind::RoundedRectangle,
+        DrawnKind::Ellipse => ShapeKind::Ellipse,
+    };
+    let story = d.textbox.and_then(|i| textbox_parts.get(i).copied().flatten());
+    InlineObject::Shape {
+        kind,
+        w: w.min(MAX_PT),
+        h: h.min(MAX_PT),
+        fill: if d.kind == DrawnKind::Line { None } else { d.fill.map(Fill::solid) },
+        stroke: d.line.map(|(c, _)| c),
+        // Widths are twips; 0 is the thinnest line.
+        stroke_width: d.line.map_or(0.0, |(_, w)| (f32::from(w) / 20.0).clamp(0.0, 100.0)),
+        float,
+        story,
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
+    }
+}

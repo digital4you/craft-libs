@@ -8,7 +8,9 @@
 //! What is read: the main text, its paragraphs and fields, the code page of each run, the
 //! character and paragraph formatting listed below, table rows, and the paragraph styles (with
 //! their formatting). Paragraph borders and shading, cell shading and paragraph spacing are
-//! read too. Character styles, headers and footers, notes, pictures and tabs are not read yet.
+//! read too, and so are the headers and footers, line numbering, and the drawn objects (lines,
+//! rectangles, ellipses and text boxes; see [`drawn_objects`]) with their text box stories.
+//! Character styles, notes, pictures and tabs are not read yet.
 //!
 //! The layout as observed:
 //!
@@ -68,12 +70,30 @@ const MAX_BINS: usize = 100_000;
 const MAX_RUNS: usize = 1_000_000;
 const OFF_FC_MIN: usize = 0x18;
 const OFF_CCP_TEXT: usize = 0x34;
+/// The character counts of the subdocuments, in Word 97's order: main text, footnotes, headers,
+/// macros, comments, endnotes, text boxes, header text boxes (u32 each from 0x34).
+const CCPS: usize = 8;
 const OFF_PAIRS: usize = 0x58;
 /// Pairs read: up to and including the piece table's.
 const PAIRS: usize = 34;
 const PAIR_STSH: usize = 1;
 /// The section table (`PlcfSed`), as in Word 97.
 const PAIR_SED: usize = 6;
+/// The header stories (`PlcfHdd`), as in Word 97, but holding only the stories the Dop and the
+/// sections say exist (see [`header_stories`]).
+const PAIR_HDD: usize = 11;
+/// The document properties (`Dop`); its second byte is the separator stories' `grpfIhdt`.
+const PAIR_DOP: usize = 31;
+/// A second run of (fc, lcb) pairs starts after four more pairs and five u16 fields (`wSpare4Fib`,
+/// `pnChpFirst`, `pnPapFirst`, `cpnBteChp`, `cpnBtePap`): the drawn objects of the main text
+/// (`PlcfdoaMom`) and of the headers (`PlcfdoaHdr`), and, at 18 and 20, the text box stories of
+/// the main text and the headers (PLCs of bare CPs).
+const OFF_PAIRS2: usize = 0x192;
+const PAIRS2: usize = 21;
+pub(crate) const PAIR2_DOA_MOM: usize = 0;
+pub(crate) const PAIR2_DOA_HDR: usize = 1;
+pub(crate) const PAIR2_TXBX: usize = 18;
+pub(crate) const PAIR2_HDR_TXBX: usize = 20;
 const PAIR_BTE_CHPX: usize = 12;
 const PAIR_BTE_PAPX: usize = 13;
 const PAIR_FONTS: usize = 15;
@@ -100,6 +120,11 @@ mod chp {
     pub(super) const BOLD: u8 = 0x55;
     /// Italic, a toggle.
     pub(super) const ITALIC: u8 = 0x56;
+    /// Strikethrough, outline, shadow: toggles, Word 97's isprm table order (Prm0) between italic
+    /// and small capitals.
+    pub(super) const STRIKE: u8 = 0x57;
+    pub(super) const OUTLINE: u8 = 0x58;
+    pub(super) const SHADOW: u8 = 0x59;
     /// Small capitals, a toggle.
     pub(super) const SMALL_CAPS: u8 = 0x5A;
     /// All capitals, a toggle.
@@ -161,6 +186,9 @@ mod pap {
 mod w97 {
     pub(super) const C_BOLD: u16 = 0x0835;
     pub(super) const C_ITALIC: u16 = 0x0836;
+    pub(super) const C_STRIKE: u16 = 0x0837;
+    pub(super) const C_OUTLINE: u16 = 0x0838;
+    pub(super) const C_SHADOW: u16 = 0x0839;
     pub(super) const C_SMALL_CAPS: u16 = 0x083A;
     pub(super) const C_CAPS: u16 = 0x083B;
     pub(super) const C_KUL: u16 = 0x2A3E;
@@ -210,7 +238,10 @@ pub(crate) struct Fib6 {
     fc_mac: u32,
     /// Characters in the main text.
     pub(crate) ccp_text: u32,
+    /// Characters in each subdocument ([`CCPS`]).
+    pub(crate) ccps: [u32; CCPS],
     pairs: [(u32, u32); PAIRS],
+    pairs2: [(u32, u32); PAIRS2],
 }
 
 impl Fib6 {
@@ -233,6 +264,16 @@ impl Fib6 {
             let at = OFF_PAIRS + i * 8;
             *p = (u32_at(at).unwrap_or(0), u32_at(at + 4).unwrap_or(0));
         }
+        // A FIB too short for the second run reads none of it.
+        let mut pairs2 = [(0, 0); PAIRS2];
+        for (i, p) in pairs2.iter_mut().enumerate() {
+            let at = OFF_PAIRS2 + i * 8;
+            *p = (u32_at(at).unwrap_or(0), u32_at(at + 4).unwrap_or(0));
+        }
+        let mut ccps = [0u32; CCPS];
+        for (i, c) in ccps.iter_mut().enumerate() {
+            *c = u32_at(OFF_CCP_TEXT + i * 4).unwrap_or(0).min(MAX_CCP);
+        }
         Ok(Fib6 {
             complex: flags & F_COMPLEX != 0,
             wide: flags & F_EXT_CHAR != 0,
@@ -240,13 +281,35 @@ impl Fib6 {
             fc_min: u32_at(OFF_FC_MIN).unwrap_or(0),
             fc_mac: u32_at(OFF_FC_MAC).unwrap_or(0),
             ccp_text,
+            ccps,
             pairs,
+            pairs2,
         })
     }
 
     /// The (fc, lcb) pair at index `i`, if it points at anything.
     fn pair(&self, i: usize) -> Option<(u32, u32)> {
         self.pairs.get(i).copied().filter(|&(_, lcb)| lcb > 0)
+    }
+
+    /// The (fc, lcb) pair at index `i` of the second run ([`OFF_PAIRS2`]), if it points at anything.
+    pub(crate) fn pair2(&self, i: usize) -> Option<(u32, u32)> {
+        self.pairs2.get(i).copied().filter(|&(_, lcb)| lcb > 0)
+    }
+
+    /// Where the header subdocument starts in the CP space, and its length.
+    pub(crate) fn header_doc(&self) -> (u32, u32) {
+        (self.ccps[0].saturating_add(self.ccps[1]), self.ccps[2])
+    }
+
+    /// Where the text box subdocument of the main text starts in the CP space, and its length.
+    pub(crate) fn textbox_doc(&self) -> (u32, u32) {
+        (self.ccps[..6].iter().fold(0u32, |a, &c| a.saturating_add(c)), self.ccps[6])
+    }
+
+    /// Where the header text box subdocument starts in the CP space, and its length.
+    pub(crate) fn header_textbox_doc(&self) -> (u32, u32) {
+        (self.ccps[..7].iter().fold(0u32, |a, &c| a.saturating_add(c)), self.ccps[7])
     }
 }
 
@@ -329,8 +392,10 @@ pub(crate) fn content(word: &[u8], fib: &Fib6) -> Result<Content, DocbinError> {
     } else {
         // Word reads no more characters than the text's byte range (fcMin..fcMac) holds, one byte
         // each or two for UTF-16, whatever the character count says.
+        // The subdocuments (footnotes, headers, text boxes...) follow the main text.
         let unit = if fib.wide { 2 } else { 1 };
-        let ccp = fib.ccp_text.min(fib.fc_mac.saturating_sub(fib.fc_min) / unit);
+        let all = fib.ccps.iter().fold(0u32, |a, &c| a.saturating_add(c));
+        let ccp = all.min(fib.fc_mac.saturating_sub(fib.fc_min) / unit);
         PieceTable::contiguous_word6(fib.fc_min, ccp, text)
     };
     let chpx = Bins::translated(chp_runs.iter().map(|r| TranslatedRun { lo: r.lo, hi: r.hi, istd: 0, grpprl: translate_chp(r.grpprl) }).collect());
@@ -694,10 +759,20 @@ fn sprms(grpprl: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     })
 }
 
-/// The sections of a Word 6.0/95 file: (end CP, properties). The section table has the Word 97
-/// layout (CPs, then 12-byte SEDs whose fcSepx points into the WordDocument stream), and a Sepx
-/// is a u16 size and a grpprl of 1-byte section sprms, translated here to their Word 97 opcodes.
-pub(crate) fn sections(word: &[u8], fib: &Fib6) -> Vec<(u32, craft_wordmodel::section::SectionProps)> {
+/// One section of a Word 6.0/95 file.
+pub(crate) struct Section6 {
+    pub(crate) end: u32,
+    pub(crate) props: craft_wordmodel::section::SectionProps,
+    /// Which of the six header and footer stories the section has its own of (sprm 153,
+    /// `sprmSGprfIhdt`): even header, odd header, even footer, odd footer, first header, first
+    /// footer, from bit 0. A story it lacks is the previous section's.
+    pub(crate) grpf_ihdt: u8,
+}
+
+/// The sections of a Word 6.0/95 file. The section table has the Word 97 layout (CPs, then
+/// 12-byte SEDs whose fcSepx points into the WordDocument stream), and a Sepx is a u16 size and a
+/// grpprl of 1-byte section sprms, translated here to their Word 97 opcodes.
+pub(crate) fn sections(word: &[u8], fib: &Fib6) -> Vec<Section6> {
     let Some((fc, lcb)) = fib.pair(PAIR_SED) else { return Vec::new() };
     let Some(plc) = word.get(fc as usize..(fc as usize).saturating_add(lcb as usize)) else { return Vec::new() };
     if plc.len() < 4 || (plc.len() - 4) % 16 != 0 {
@@ -710,9 +785,182 @@ pub(crate) fn sections(word: &[u8], fib: &Fib6) -> Vec<(u32, craft_wordmodel::se
         let Some(end) = u32_at((i + 1) * 4) else { break };
         let fc_sepx = u32_at((((plc.len() - 4) / 16) + 1) * 4 + i * 12 + 2).unwrap_or(u32::MAX);
         let grpprl = if fc_sepx == u32::MAX { &[][..] } else { crate::sections::sepx(word, fc_sepx).unwrap_or_default() };
-        out.push((end, crate::sections::from_grpprl(&translate_sep(grpprl))));
+        let (translated, grpf_ihdt) = translate_sep(grpprl);
+        out.push(Section6 { end, props: crate::sections::from_grpprl(&translated), grpf_ihdt });
     }
     out
+}
+
+/// The CP ranges (within the header subdocument) of each section's header and footer stories, as
+/// (section, slot, range) with the slots in Word 97's order (even header, odd header, even
+/// footer, odd footer, first header, first footer). `PlcfHdd` lists only the stories that exist:
+/// first the separators the Dop's `grpfIhdt` names (one per set bit of its low six), then, per
+/// section, one per set bit of the section's `grpfIhdt`, in bit order.
+pub(crate) fn header_stories(word: &[u8], fib: &Fib6, sects: &[Section6]) -> Vec<(usize, usize, (u32, u32))> {
+    let Some((fc, lcb)) = fib.pair(PAIR_HDD) else { return Vec::new() };
+    let Some(plc) = word.get(fc as usize..(fc as usize).saturating_add(lcb as usize)) else { return Vec::new() };
+    let cp_at = |i: usize| plc.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let dop_grpf = fib.pair(PAIR_DOP).and_then(|(fc, _)| word.get(fc as usize + 1)).copied().unwrap_or(0);
+    let mut at = (dop_grpf & 0x3F).count_ones() as usize;
+    let mut out = Vec::new();
+    // A story starting before the end of an earlier one is left out, as for Word 97 files.
+    let mut kept_to = 0u32;
+    for (si, sect) in sects.iter().enumerate() {
+        for slot in 0..6 {
+            if sect.grpf_ihdt & (1 << slot) == 0 {
+                continue;
+            }
+            let (Some(a), Some(b)) = (cp_at(at), cp_at(at + 1)) else { return out };
+            at += 1;
+            if a >= kept_to && b > a {
+                kept_to = b;
+                out.push((si, slot, (a, b)));
+            }
+        }
+    }
+    out
+}
+
+/// One drawn object primitive of a Word 6.0/95 file, placed in twips.
+pub(crate) struct Drawn6 {
+    /// The anchor CP (absolute).
+    pub(crate) cp: u32,
+    /// The anchor's horizontal and vertical reference (`bx`, `by`: 0 margin, 1 page, 2 column or
+    /// paragraph).
+    pub(crate) bx: u8,
+    pub(crate) by: u8,
+    pub(crate) kind: DrawnKind,
+    /// The box: left, top, width, height in twips; for a line, from its start to its end (the
+    /// width and height may be negative).
+    pub(crate) rect: [i32; 4],
+    /// Line colour and width (twips); None for no line.
+    pub(crate) line: Option<(craft_wordmodel::Rgb, u16)>,
+    pub(crate) fill: Option<craft_wordmodel::Rgb>,
+    /// For a text box, its index among the subdocument's text box stories.
+    pub(crate) textbox: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrawnKind {
+    Line,
+    TextBox,
+    Rect,
+    RoundRect,
+    Ellipse,
+}
+
+/// Most drawn objects and primitives read from one PLC.
+const MAX_DRAWN: usize = 10_000;
+
+/// The drawn objects (`PlcfdoaMom` or `PlcfdoaHdr`, the pair at `pair`) and their primitives.
+/// The PLC holds CPs (relative to `cp_base`) and 6-byte FDOAs: the DO's offset in the
+/// WordDocument stream and how many text boxes it holds. A DO is `dok` (u16), its size (u16),
+/// `bx` and `by` (u8), two u16 fields, then the primitives: each a DPHEAD (kind, size, xa, ya,
+/// dxa, dya, all 16-bit) and its own fields. Groups (kinds 0 and 8) offset what they hold by their
+/// own xa and ya. Arcs, polylines and callouts are not read; text boxes still count for the
+/// numbering of the text box stories.
+pub(crate) fn drawn_objects(word: &[u8], pair: Option<(u32, u32)>, cp_base: u32) -> Vec<Drawn6> {
+    let Some((fc, lcb)) = pair else { return Vec::new() };
+    let Some(plc) = word.get(fc as usize..(fc as usize).saturating_add(lcb as usize)) else { return Vec::new() };
+    if plc.len() < 4 {
+        return Vec::new();
+    }
+    let n = ((plc.len() - 4) / 10).min(MAX_DRAWN);
+    let u16_at = |b: &[u8], at: usize| b.get(at..at + 2).map(|v| u16::from_le_bytes([v[0], v[1]]));
+    let i16_at = |b: &[u8], at: usize| u16_at(b, at).map(|v| i32::from(v as i16));
+    let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+    // COLORREF bytes: red, green, blue, then 0.
+    let color = |b: &[u8], at: usize| b.get(at..at + 3).map(|v| craft_wordmodel::Rgb(v[0], v[1], v[2]));
+    let mut out = Vec::new();
+    let mut textboxes = 0usize;
+    for i in 0..n {
+        let (Some(cp), Some(fc_do)) = (u32_at(plc, i * 4), u32_at(plc, (n + 1) * 4 + i * 6)) else { break };
+        let Some(head) = word.get(fc_do as usize..) else { continue };
+        let Some(cb) = u16_at(head, 2) else { continue };
+        let Some(dobj) = head.get(..usize::from(cb)) else { continue };
+        let (Some(&bx), Some(&by)) = (dobj.get(4), dobj.get(5)) else { continue };
+        let mut at = 10usize;
+        let mut offset = Vec::<(i32, i32)>::new();
+        while out.len() < MAX_DRAWN {
+            let (Some(dpk), Some(size)) = (u16_at(dobj, at), u16_at(dobj, at + 2)) else { break };
+            let size = usize::from(size);
+            let Some(prim) = dobj.get(at..at + size).filter(|_| size >= 12) else { break };
+            at += size;
+            let (ox, oy) = offset.last().copied().unwrap_or((0, 0));
+            let [xa, ya, dxa, dya] = [4, 6, 8, 10].map(|o| i16_at(prim, o).unwrap_or(0));
+            let (x, y) = (ox + xa, oy + ya);
+            // The line (DP_LINETYPE: colour u32, width u16, style u16 where 5 is none) after the
+            // DPHEAD, or after a line's two end points; then the fill (DP_FILL: foreground and
+            // background colours, pattern u16 where 0 is none).
+            let line_at = |o: usize| -> Option<(craft_wordmodel::Rgb, u16)> {
+                let style = u16_at(prim, o + 6)?;
+                (style != 5).then_some((color(prim, o)?, u16_at(prim, o + 4)?))
+            };
+            let fill_at = |o: usize| -> Option<craft_wordmodel::Rgb> {
+                let pattern = u16_at(prim, o + 8)?;
+                // As LibreOffice: a solid or unknown pattern is the background colour, a
+                // percentage one the foreground mixed into the background.
+                const PERCENT: [u16; 14] = [0, 0, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90];
+                let (fg, bg) = (color(prim, o)?, color(prim, o + 4)?);
+                match pattern {
+                    0 => None,
+                    p if p as usize >= PERCENT.len() || p == 1 => Some(bg),
+                    p => {
+                        let k = u32::from(PERCENT[p as usize]);
+                        let mix = |f: u8, b: u8| ((u32::from(f) * k + u32::from(b) * (100 - k)) / 100) as u8;
+                        Some(craft_wordmodel::Rgb(mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2)))
+                    }
+                }
+            };
+            let base = Drawn6 {
+                cp: cp_base.saturating_add(cp),
+                bx,
+                by,
+                kind: DrawnKind::Rect,
+                rect: [x, y, dxa, dya],
+                line: None,
+                fill: None,
+                textbox: None,
+            };
+            // The kind is the low byte (Word sets flags in the high one).
+            match dpk & 0xFF {
+                0 => offset.push((x, y)),
+                8 => {
+                    offset.pop();
+                }
+                1 => {
+                    let [xs, ys, xe, ye] = [12, 14, 16, 18].map(|o| i16_at(prim, o).unwrap_or(0));
+                    out.push(Drawn6 { kind: DrawnKind::Line, rect: [ox + xs, oy + ys, xe - xs, ye - ys], line: line_at(20), ..base });
+                }
+                2 => {
+                    out.push(Drawn6 { kind: DrawnKind::TextBox, line: line_at(12), fill: fill_at(20), textbox: Some(textboxes), ..base });
+                    textboxes += 1;
+                }
+                3 => {
+                    let round = u16_at(prim, 36).is_some_and(|v| v & 1 != 0);
+                    let kind = if round { DrawnKind::RoundRect } else { DrawnKind::Rect };
+                    out.push(Drawn6 { kind, line: line_at(12), fill: fill_at(20), ..base });
+                }
+                5 => out.push(Drawn6 { kind: DrawnKind::Ellipse, line: line_at(12), fill: fill_at(20), ..base }),
+                // A callout holds a text box too.
+                7 => textboxes += 1,
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The text box stories of a Word 6.0/95 file (the pair at `pair`): a PLC of bare CPs, story i
+/// spanning `[cps[i], cps[i+1])` within its subdocument. The last range is the guard that ends
+/// the subdocument, not a story.
+pub(crate) fn textbox_stories(word: &[u8], pair: Option<(u32, u32)>) -> Vec<(u32, u32)> {
+    let Some((fc, lcb)) = pair else { return Vec::new() };
+    let Some(plc) = word.get(fc as usize..(fc as usize).saturating_add(lcb as usize)) else { return Vec::new() };
+    let cps: Vec<u32> = plc.chunks_exact(4).take(MAX_DRAWN + 2).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let mut stories: Vec<(u32, u32)> = cps.windows(2).map(|w| (w[0], w[1])).collect();
+    stories.pop();
+    stories
 }
 
 /// Most sections read from a Word 6.0/95 file.
@@ -721,8 +969,9 @@ const MAX_SECTIONS: usize = 10_000;
 /// A Word 6.0/95 Sepx grpprl as the Word 97 section sprms it stands for. The operand sizes and
 /// the opcode correspondence follow docboss (crates/docboss-doc/src/word6.rs, MIT OR
 /// Apache-2.0); a code of unknown size ends the walk.
-fn translate_sep(grpprl: &[u8]) -> Vec<u8> {
+fn translate_sep(grpprl: &[u8]) -> (Vec<u8>, u8) {
     let mut out = Vec::new();
+    let mut grpf_ihdt = 0u8;
     let mut at = 0usize;
     while let Some(&code) = grpprl.get(at) {
         let len = match code {
@@ -743,6 +992,11 @@ fn translate_sep(grpprl: &[u8]) -> Vec<u8> {
             145 => Some(0x900C),
             147 => Some(0x300E),
             150 => Some(0x3011),
+            // Line numbering: restart, count-by, distance, first number.
+            152 => Some(0x3013),
+            154 => Some(0x5015),
+            155 => Some(0x9016),
+            160 => Some(0x501B),
             156 => Some(0xB017),
             157 => Some(0xB018),
             158 => Some(0x3019),
@@ -757,12 +1011,15 @@ fn translate_sep(grpprl: &[u8]) -> Vec<u8> {
             170 => Some(0xB025),
             _ => None,
         };
+        if code == 153 {
+            grpf_ihdt = v[0];
+        }
         if let Some(op) = op {
             prl(&mut out, op, v);
         }
         at += 1 + len;
     }
-    out
+    (out, grpf_ihdt)
 }
 
 /// Append a Word 97 Prl: opcode, then operand.
@@ -778,6 +1035,9 @@ fn translate_chp(grpprl: &[u8]) -> Vec<u8> {
         match op {
             chp::BOLD => prl(&mut out, w97::C_BOLD, v),
             chp::ITALIC => prl(&mut out, w97::C_ITALIC, v),
+            chp::STRIKE => prl(&mut out, w97::C_STRIKE, v),
+            chp::OUTLINE => prl(&mut out, w97::C_OUTLINE, v),
+            chp::SHADOW => prl(&mut out, w97::C_SHADOW, v),
             chp::SMALL_CAPS => prl(&mut out, w97::C_SMALL_CAPS, v),
             chp::CAPS => prl(&mut out, w97::C_CAPS, v),
             // Only none and single were seen; any other value is left unread.

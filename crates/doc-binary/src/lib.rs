@@ -354,6 +354,7 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
         raw_styles: &raw_styles,
         sheet: &sheet,
         notes: &[],
+        own_note: None,
         marks: &[],
         drawn: &[],
         sect_ends: &[],
@@ -415,20 +416,27 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     // Footnote and endnote stories: each text range becomes a part; the reference CPs then
     // link to the part ids during the main walk.
     let mut note_links: Vec<(u32, NoteKind, u32)> = Vec::new();
-    for (cp, ab) in notes::parse_notes(&table, &fib, fib::pair::PLCF_FND_REF, fib::pair::PLCF_FND_TXT) {
-        let Some((a, b)) = story(ftn_base, fib.ccp.ftn, ab) else { continue };
-        let blocks = story_blocks(&ctx, a, b, &mut pics, max_paragraphs)?;
-        if !blocks.is_empty() && doc.parts.len() < MAX_PARTS {
-            let id = doc.add_part(PartKind::Footnote, blocks);
-            note_links.push((cp, NoteKind::Footnote, id));
-        }
-    }
-    for (cp, ab) in notes::parse_notes(&table, &fib, fib::pair::PLCF_END_REF, fib::pair::PLCF_END_TXT) {
-        let Some((a, b)) = story(edn_base, fib.ccp.edn, ab) else { continue };
-        let blocks = story_blocks(&ctx, a, b, &mut pics, max_paragraphs)?;
-        if !blocks.is_empty() && doc.parts.len() < MAX_PARTS {
-            let id = doc.add_part(PartKind::Endnote, blocks);
-            note_links.push((cp, NoteKind::Endnote, id));
+    for (kind, part_kind, refs, texts, base, len) in [
+        (NoteKind::Footnote, PartKind::Footnote, fib::pair::PLCF_FND_REF, fib::pair::PLCF_FND_TXT, ftn_base, fib.ccp.ftn),
+        (NoteKind::Endnote, PartKind::Endnote, fib::pair::PLCF_END_REF, fib::pair::PLCF_END_TXT, edn_base, fib.ccp.edn),
+    ] {
+        for (cp, ab) in notes::parse_notes(&table, &fib, refs, texts) {
+            let Some((a, b)) = story(base, len, ab) else { continue };
+            if doc.parts.len() >= MAX_PARTS {
+                continue;
+            }
+            // The part is added first, so the walk knows the id its own number refers to.
+            let id = doc.add_part(part_kind, craft_wordmodel::Blocks::new());
+            let blocks = story_blocks(&WalkCtx { own_note: Some((kind, id)), ..ctx }, a, b, &mut pics, max_paragraphs)?;
+            match doc.parts.get_mut(&id) {
+                Some(part) if !blocks.is_empty() => {
+                    part.blocks = blocks;
+                    note_links.push((cp, kind, id));
+                }
+                _ => {
+                    doc.parts.remove(&id);
+                }
+            }
         }
     }
     // Sorted so the main walk finds each reference by binary search.
@@ -512,6 +520,7 @@ fn read_word6(comp: Option<&craft_cfb::CompoundFile<'_>>, word: &[u8], max_parag
         raw_styles: &content.styles,
         sheet: &sheet,
         notes: &[],
+        own_note: None,
         marks: &[],
         drawn: &[],
         sect_ends: &[],
@@ -520,28 +529,72 @@ fn read_word6(comp: Option<&craft_cfb::CompoundFile<'_>>, word: &[u8], max_parag
         work: &work,
         revs: &revs,
     };
+    let sects = word6::sections(word, &fib);
+    // Text boxes: the text box stories of the main text and of the headers become parts, then
+    // the drawn objects find them by their index.
+    let (hdd_base, ccp_hdd) = fib.header_doc();
+    let mut drawn: Vec<(u32, InlineObject)> = Vec::new();
+    for (txbx_pair, (base, len), doa_pair, cp_base) in [
+        (word6::PAIR2_TXBX, fib.textbox_doc(), word6::PAIR2_DOA_MOM, 0),
+        (word6::PAIR2_HDR_TXBX, fib.header_textbox_doc(), word6::PAIR2_DOA_HDR, hdd_base),
+    ] {
+        let mut parts = Vec::new();
+        for ab in word6::textbox_stories(word, fib.pair2(txbx_pair)) {
+            let id = match story(base, len, ab) {
+                Some((a, b)) if doc.parts.len() < MAX_PARTS => {
+                    let blocks = story_blocks(&ctx, a, b, &mut pics, max_paragraphs)?;
+                    Some(doc.add_part(PartKind::TextBox, blocks))
+                }
+                _ => None,
+            };
+            parts.push(id);
+        }
+        drawn.extend(word6::drawn_objects(word, fib.pair2(doa_pair), cp_base).iter().map(|d| (d.cp, drawing::word6_object(d, &parts))));
+    }
+    drawn.sort_by_key(|(cp, _)| *cp);
+    let ctx = WalkCtx { drawn: &drawn, ..ctx };
+    // Header and footer parts, by section and slot (see [`word6::header_stories`]).
+    let mut hf_ids: Vec<(usize, usize, u32)> = Vec::new();
+    for (si, slot, ab) in word6::header_stories(word, &fib, &sects) {
+        let Some((a, b)) = story(hdd_base, ccp_hdd, ab) else { continue };
+        if doc.parts.len() >= MAX_PARTS {
+            break;
+        }
+        let kind = if matches!(slot, 0 | 1 | 4) { PartKind::Header } else { PartKind::Footer };
+        let blocks = header_story_blocks(&ctx, a, b, &mut pics, max_paragraphs)?;
+        if !blocks.is_empty() {
+            hf_ids.push((si, slot, doc.add_part(kind, blocks)));
+        }
+    }
+    let with_headers = |si: usize, props: &craft_wordmodel::section::SectionProps| {
+        let mut props = props.clone();
+        let id_of = |k: usize| hf_ids.iter().find(|(s, kk, _)| *s == si && *kk == k).map(|(_, _, id)| *id);
+        props.headers = HeaderSet { even: id_of(0), default: id_of(1), first: id_of(4) };
+        props.footers = HeaderSet { even: id_of(2), default: id_of(3), first: id_of(5) };
+        props
+    };
     // Sections: each one's properties go on the paragraph its section mark ends, the last
     // section's on the document, as for Word 97 files.
-    let sects = word6::sections(word, &fib);
-    let mut sect_ends: Vec<u32> = sects.iter().map(|(end, _)| *end).collect();
+    let mut sect_ends: Vec<u32> = sects.iter().map(|s| s.end).collect();
     sect_ends.sort_unstable();
     let ctx = WalkCtx { sect_ends: &sect_ends, ..ctx };
     let mut paras = walk(&ctx, 0, fib.ccp_text, &mut pics);
     if paragraphs.exceeded.get() {
         return Err(paragraph_limit(max_paragraphs));
     }
-    if let Some((_, last)) = sects.last() {
-        doc.last_section = last.clone();
+    if let Some(last) = sects.last() {
+        doc.last_section = with_headers(sects.len() - 1, &last.props);
     }
-    for (si, (end, props)) in sects.iter().enumerate() {
-        if si + 1 == sects.len() || *end >= fib.ccp_text {
+    for (si, sect) in sects.iter().enumerate() {
+        if si + 1 == sects.len() || sect.end >= fib.ccp_text {
             continue;
         }
-        let at = paras.partition_point(|p| p.end_cp < *end);
-        if let Some(p) = paras.get_mut(at).filter(|p| p.end_cp == *end) {
-            p.para.section = Some(Box::new(props.clone()));
+        let at = paras.partition_point(|p| p.end_cp < sect.end);
+        if let Some(p) = paras.get_mut(at).filter(|p| p.end_cp == sect.end) {
+            p.para.section = Some(Box::new(with_headers(si, &sect.props)));
         }
     }
+    doc.media.extend(pics.media);
     doc.body = table::assemble(paras);
     doc.ensure_nonempty();
     work.log();
@@ -631,6 +684,9 @@ struct WalkCtx<'a> {
     sheet: &'a StyleSheet,
     /// (reference CP in the main document, kind, part id) for notes.
     notes: &'a [(u32, NoteKind, u32)],
+    /// The note whose story is being walked (kind, part id): its own reference mark (0x02, the
+    /// number at the start of its text) refers to it.
+    own_note: Option<(NoteKind, u32)>,
     /// Bookmark boundaries (main-document CPs), sorted for a sequential walk.
     marks: &'a [(u32, notes::Mark)],
     /// Floating shapes and pictures by anchor CP (absolute), sorted.
@@ -685,6 +741,9 @@ struct ParaBuild {
     run_gen: Option<u64>,
     /// Inline objects, each anchored at a U+FFFC pushed into `text`.
     objects: Vec<InlineObject>,
+    /// The paragraph style the characters' toggles invert, looked up at the first character
+    /// (its mark, which sets [`ParaBuild::props`], comes last).
+    style_ahead: Option<Option<String>>,
 }
 
 impl ParaBuild {
@@ -863,7 +922,9 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                 fmt::settle_frame(&mut pb.props);
                 let fc = ctx.pieces.fc_of_cp(cp).unwrap_or(0);
                 let chpx = ctx.chpx_bins.chpx(ctx.word, fc);
-                pb.mark = char_props(chpx, ctx.fonts, &CharProps::default());
+                // The mark's toggles invert its paragraph style's values, as the characters' do.
+                let toggle_base = pb.props.style.as_deref().and_then(|id| ctx.sheet.get(id)).map(|sty| sty.chr.clone()).unwrap_or_default();
+                pb.mark = char_props(chpx, ctx.fonts, CharProps::default(), &toggle_base);
                 // A tracked paragraph mark: an inserted or deleted paragraph break.
                 ctx.revs.mark(&mut pb.mark, chpx, ctx.pieces.piece_prm(cp));
                 let done = std::mem::take(&mut pb);
@@ -971,6 +1032,10 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                 if let Some((_, kind, id)) = ctx.notes.get(at).filter(|(c, _, _)| *c == cp) {
                     pb.push('\u{FFFC}', anchor_props(ctx, cp));
                     pb.objects.push(InlineObject::NoteRef { kind: *kind, id: *id, custom: String::new() });
+                } else if let Some((kind, id)) = ctx.own_note {
+                    // In a note's own story: the note's number.
+                    pb.push('\u{FFFC}', anchor_props(ctx, cp));
+                    pb.objects.push(InlineObject::NoteRef { kind, id, custom: String::new() });
                 }
             }
             _ if field.is_none() && ranges.last().is_some_and(Option::is_some) && !matches!(c, '\u{0}'..='\u{8}' | '\u{A}' | '\u{D}'..='\u{12}' | '\u{16}'..='\u{1D}') => {
@@ -1220,31 +1285,29 @@ fn push_formatted<'a>(pb: &mut ParaBuild, cp: u32, c: char, ctx: &WalkCtx<'a>, f
     };
     let grpprl = run.grpprl;
     let prm = span.map_or(0, |s| s.prm());
-    let style = pb.props.style.as_deref();
+    // The paragraph's style comes with its mark, after its characters: it is looked up ahead,
+    // at the paragraph properties of the first character's FC (the PAPX run that holds it ends
+    // at its paragraph's mark).
+    if pb.style_ahead.is_none() {
+        pb.style_ahead = Some(style_at(ctx, fc));
+    }
+    let style = pb.style_ahead.as_ref().and_then(Option::as_deref);
     let hit = st.memo.as_ref().is_some_and(|m| std::ptr::eq(m.chpx, grpprl) && m.prm == prm && m.style.as_deref() == style);
     if !hit {
-        let default;
-        let base = match style.and_then(|id| ctx.sheet.get(id)) {
-            Some(sty) => &sty.chr,
-            None => {
-                default = CharProps::default();
-                &default
-            }
-        };
-        // A character style applies over the paragraph style's properties, and the run's own
-        // toggles then invert what the two give together ([MS-DOC] sprmCIstd, sprmCFBold).
-        let styled;
-        let base = if sprm::iter(grpprl).any(|p| p.op == 0x4A30) {
-            let mut b = base.clone();
-            fmt::apply_char_style(&mut b, grpprl, ctx.raw_styles, ctx.fonts);
-            styled = b;
-            &styled
-        } else {
-            base
-        };
-        let mut props = char_props(grpprl, ctx.fonts, base);
+        // The run keeps only its own formatting (and its character style's); the paragraph
+        // style's properties are what its toggles invert ([MS-DOC] sprmCFBold: 0x81 is the
+        // opposite of the style's value). A character style applies over the paragraph style's
+        // properties, and the run's toggles then invert what the two give together ([MS-DOC]
+        // sprmCIstd).
+        let mut start = CharProps::default();
+        let mut toggle_base = style.and_then(|id| ctx.sheet.get(id)).map(|sty| sty.chr.clone()).unwrap_or_default();
+        if sprm::iter(grpprl).any(|p| p.op == 0x4A30) {
+            fmt::apply_char_style(&mut start, grpprl, ctx.raw_styles, ctx.fonts);
+            fmt::apply_char_style(&mut toggle_base, grpprl, ctx.raw_styles, ctx.fonts);
+        }
+        let mut props = char_props(grpprl, ctx.fonts, start, &toggle_base);
         let piece_prm = ctx.pieces.piece_prm(cp);
-        apply_prm(&mut props, piece_prm, ctx.fonts, base, ctx.work);
+        apply_prm(&mut props, piece_prm, ctx.fonts, &toggle_base, ctx.work);
         ctx.revs.mark(&mut props, grpprl, piece_prm);
         st.memo = Some(FmtMemo { chpx: grpprl, prm, style: style.map(str::to_owned), props });
         st.generation += 1;
@@ -1380,12 +1443,25 @@ fn apply_prm(props: &mut CharProps, prm: PrmRef<'_>, fonts: &[String], base: &Ch
     }
 }
 
-/// Character props from a CHPX grpprl applied over `base`.
-fn char_props(grpprl: &[u8], fonts: &[String], base: &CharProps) -> CharProps {
-    let mut p = base.clone();
+/// The style id of the paragraph whose properties hold `fc` (its PAPX's istd, or the sprmPIstd
+/// in it).
+fn style_at(ctx: &WalkCtx<'_>, fc: u32) -> Option<String> {
+    let (istd, papx) = ctx.papx_bins.papx(ctx.word, fc);
+    let istd = sprm::iter(papx)
+        .filter(|p| p.op == P_ISTD)
+        .filter_map(|p| p.operand.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]])))
+        .last()
+        .unwrap_or(istd);
+    ctx.raw_styles.get(istd as usize).filter(|s| !s.name.is_empty()).map(|st| fmt::style_id(&st.name))
+}
+
+/// Character props from a CHPX grpprl applied over `start`, its toggles inverting `toggle_base`
+/// (the paragraph style's values, with the run's character style over them).
+fn char_props(grpprl: &[u8], fonts: &[String], start: CharProps, toggle_base: &CharProps) -> CharProps {
+    let mut p = start;
     for prl in sprm::iter(grpprl) {
         if prl.sgc() == 2 {
-            fmt::apply_char(&mut p, &prl, base, fonts);
+            fmt::apply_char(&mut p, &prl, toggle_base, fonts);
         }
     }
     p

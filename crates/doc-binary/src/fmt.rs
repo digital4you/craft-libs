@@ -12,6 +12,10 @@ use crate::sprm::{self, Prl, Toggle};
 const C_BOLD: u16 = 0x0835;
 const C_ITALIC: u16 = 0x0836;
 const C_STRIKE: u16 = 0x0837;
+const C_OUTLINE: u16 = 0x0838;
+const C_SHADOW: u16 = 0x0839;
+const C_IMPRINT: u16 = 0x0854; // engraved (sprmCFImprint)
+const C_EMBOSS: u16 = 0x0858;
 const C_SMALL_CAPS: u16 = 0x083A;
 const C_CAPS: u16 = 0x083B;
 const C_HIDDEN: u16 = 0x083C; // sprmCFVanish
@@ -262,6 +266,10 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
         C_BOLD => set(&mut p.bold, sprm::toggle(prl), base.bold.unwrap_or(false)),
         C_ITALIC => set(&mut p.italic, sprm::toggle(prl), base.italic.unwrap_or(false)),
         C_STRIKE => set(&mut p.strike, sprm::toggle(prl), base.strike.unwrap_or(false)),
+        C_OUTLINE => set(&mut p.outline, sprm::toggle(prl), base.outline.unwrap_or(false)),
+        C_SHADOW => set(&mut p.shadow, sprm::toggle(prl), base.shadow.unwrap_or(false)),
+        C_IMPRINT => set(&mut p.engrave, sprm::toggle(prl), base.engrave.unwrap_or(false)),
+        C_EMBOSS => set(&mut p.emboss, sprm::toggle(prl), base.emboss.unwrap_or(false)),
         C_SMALL_CAPS => set(&mut p.small_caps, sprm::toggle(prl), base.small_caps.unwrap_or(false)),
         C_CAPS => set(&mut p.caps, sprm::toggle(prl), base.caps.unwrap_or(false)),
         C_HIDDEN => set(&mut p.hidden, sprm::toggle(prl), base.hidden.unwrap_or(false)),
