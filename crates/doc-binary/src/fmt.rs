@@ -54,6 +54,7 @@ const P_DYA_LINE: u16 = 0x6412;
 const P_KEEP: u16 = 0x2405; // keep lines together
 const P_KEEP_FOLLOW: u16 = 0x2406; // keep with next
 const P_PAGE_BREAK_BEFORE: u16 = 0x2407;
+const P_WIDOW_CONTROL: u16 = 0x2431; // sprmPFWidowControl
 const P_OUTLVL: u16 = 0x2640;
 const P_CONTEXTUAL_SPACING: u16 = 0x246D; // sprmPFContextualSpacing
 // Paragraph borders ([MS-DOC] §2.6.2). The 80 forms carry a Brc80 (palette colour), the
@@ -504,6 +505,16 @@ pub(crate) fn settle_frame(p: &mut ParaProps) {
     }
 }
 
+/// A paragraph toggle's value: on or off, `None` for the character toggles' "as the style"
+/// and "inverted" operands, which paragraph properties don't use.
+fn on_off(prl: &Prl) -> Option<bool> {
+    match sprm::toggle(prl) {
+        Toggle::On => Some(true),
+        Toggle::Off => Some(false),
+        Toggle::Keep | Toggle::Invert => None,
+    }
+}
+
 /// Apply a paragraph-property sprm.
 pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
     let tw = |v: i32| (v as f32 / 20.0).clamp(-1000.0, 1000.0);
@@ -600,19 +611,26 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 });
             }
         }
+        // On or off; an explicit off turns off what the style (or the style it is based on) turns
+        // on, as a heading style based on one that starts a page does.
         P_KEEP => {
-            if matches!(sprm::toggle(prl), Toggle::On) {
-                p.keep_lines = Some(true);
+            if let Some(v) = on_off(prl) {
+                p.keep_lines = Some(v);
             }
         }
         P_KEEP_FOLLOW => {
-            if matches!(sprm::toggle(prl), Toggle::On) {
-                p.keep_next = Some(true);
+            if let Some(v) = on_off(prl) {
+                p.keep_next = Some(v);
             }
         }
         P_PAGE_BREAK_BEFORE => {
-            if matches!(sprm::toggle(prl), Toggle::On) {
-                p.page_break_before = Some(true);
+            if let Some(v) = on_off(prl) {
+                p.page_break_before = Some(v);
+            }
+        }
+        P_WIDOW_CONTROL => {
+            if let Some(&v) = prl.operand.first() {
+                p.widow_control = Some(v != 0);
             }
         }
         // No space before or after between paragraphs of the same style ([MS-DOC]

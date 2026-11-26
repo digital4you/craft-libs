@@ -2,7 +2,6 @@
 //! the `Plcfhdd` stories of the header subdocument ([MS-DOC] §2.8.25, §2.9.244).
 
 use craft_wordmodel::props::Borders;
-use craft_wordmodel::section::NumFormat;
 use craft_wordmodel::section::{Columns, LineNumberRestart, LineNumbering, SectionProps, SectionStart};
 
 use crate::fib::{Fib, pair};
@@ -15,7 +14,9 @@ const MAX_SECTIONS: usize = 1024;
 const S_BKC: u16 = 0x3009;
 const S_TITLE_PAGE: u16 = 0x300A; // sprmSFTitlePage
 const S_CCOLUMNS: u16 = 0x500B;
-const S_PGN_START: u16 = 0x300C; // sprmSPgnStart
+const S_NFC_PGN: u16 = 0x300E; // sprmSNfcPgn: page number format
+const S_PGN_RESTART: u16 = 0x3011; // sprmSFPgnRestart
+const S_PGN_START: u16 = 0x501C; // sprmSPgnStart97
 const S_FEVENLY_SPACED: u16 = 0x3005; // sprmSFEvenlySpaced
 const S_DXA_COLUMNS: u16 = 0x900C; // sprmSDxaColumns: space between equal columns
 const S_DXA_COL_WIDTH: u16 = 0xF203; // sprmSDxaColWidth: column index, width
@@ -98,6 +99,10 @@ pub(crate) fn from_grpprl(grpprl: &[u8]) -> SectionProps {
     // the page edge, and whether they are on every page (pgbApplyTo 0).
     let mut borders_from_text = true;
     let mut borders_every_page = true;
+    // Page numbering restarts (sprmSFPgnRestart) at sprmSPgnStart97, 1 when it isn't given,
+    // whatever order they come in.
+    let mut pgn_restart = false;
+    let mut pgn_start = None;
     for prl in sprm::iter(grpprl) {
         // Only a defined operand counts as explicit; anything else leaves the
         // orientation to the page shape.
@@ -123,6 +128,8 @@ pub(crate) fn from_grpprl(grpprl: &[u8]) -> SectionProps {
                 borders_from_text = (v >> 5) & 7 == 0;
                 borders_every_page = v & 7 == 0;
             }
+            S_PGN_RESTART => pgn_restart = prl.operand.first().is_some_and(|&v| v != 0),
+            S_PGN_START => pgn_start = u16_op().map(|v| u32::from(v.min(32_767))),
             S_FEVENLY_SPACED => evenly = prl.operand.first().is_none_or(|&v| v != 0),
             S_DXA_COLUMNS => col_space = u16_op().map(|v| (f32::from(v as i16) / 20.0).clamp(0.0, 1584.0)),
             S_LBETWEEN => separator = prl.operand.first().is_some_and(|&v| v != 0),
@@ -141,6 +148,9 @@ pub(crate) fn from_grpprl(grpprl: &[u8]) -> SectionProps {
             }
             _ => apply_section(&mut props, &prl),
         }
+    }
+    if pgn_restart {
+        props.page_num_start = Some(pgn_start.unwrap_or(1));
     }
     // The model has page borders on every page of a section or none: borders on the first page
     // only, or on all pages but the first, are left out rather than drawn on every page.
@@ -216,10 +226,9 @@ fn apply_section(s: &mut SectionProps, prl: &Prl) {
                 s.columns = Columns { count: (c as u32).saturating_add(1).min(44), ..Default::default() };
             }
         }
-        S_PGN_START => {
-            if let Some(v) = s16(prl) {
-                s.page_num_start = Some(v.max(0) as u32);
-                s.page_num_format = NumFormat::Decimal;
+        S_NFC_PGN => {
+            if let Some(&nfc) = prl.operand.first() {
+                s.page_num_format = crate::list::num_format(nfc);
             }
         }
         // SBOrientationOperand ([MS-DOC] §2.9.236): 1 portrait, 2 landscape.

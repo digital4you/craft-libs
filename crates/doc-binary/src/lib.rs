@@ -317,6 +317,15 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     {
         doc.settings.default_tab = f32::from(v) / 20.0;
     }
+    // Different odd and even pages: the Dop's fFacingPages, bit 0 of its first byte ([MS-DOC]
+    // DopBase). Word also decides by it whether a section starting on an odd or even page whose
+    // numbering restarts gets a blank page before it.
+    if let Some((fc, lcb)) = fib.pair(fib::pair::DOP)
+        && lcb >= 1
+        && let Some(&b) = table.get(fc as usize)
+    {
+        doc.settings.even_odd_headers = b & 1 != 0;
+    }
     if let Some(core) = metadata::read(&comp) {
         doc.core = core;
     }

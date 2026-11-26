@@ -61,7 +61,7 @@ const T_CELL_PADDING_DEFAULT: u16 = 0xD632;
 const T_CELL_PADDING: u16 = 0xD634;
 /// `sprmTTableWidth`: the table's preferred width, an `FtsWWidth_Table`.
 const T_TABLE_WIDTH: u16 = 0xF614;
-/// `sprmTFAutofit`: 0 = fixed column widths.
+/// `sprmTFAutofit`: 1 = AutoFit, 0 = fixed column widths.
 const T_FAUTOFIT: u16 = 0x3615;
 /// Deepest table nesting we build; deeper marks are treated as this depth, so hostile depths
 /// cannot recurse without bound. Word itself stops at 63.
@@ -111,7 +111,9 @@ pub(crate) struct RowInfo {
     margins: Option<[f32; 4]>,
     width: Option<f32>,
     width_pct: Option<f32>,
-    fixed: bool,
+    /// AutoFit (sprmTFAutofit on). Without the sprm (Word 97, which had no AutoFit) the columns
+    /// keep the widths the file gives, as in Word.
+    autofit: bool,
     /// Horizontal merges: (itcFirst, itcLim) cell-index ranges.
     merges: Vec<(u8, u8)>,
     /// Per-cell overrides keyed by (pre-merge) cell index.
@@ -262,7 +264,7 @@ pub(crate) fn decode(papx: &[u8]) -> RowInfo {
                     }
                 }
             }
-            T_FAUTOFIT => r.fixed = prl.operand.first() == Some(&0),
+            T_FAUTOFIT => r.autofit = prl.operand.first().copied().unwrap_or(0) != 0,
             T_MERGE => {
                 // Rows apply only the first MAX_COLS merges.
                 if let [a, b, ..] = prl.operand
@@ -516,7 +518,7 @@ fn build_table(rows: Vec<(Vec<Cell>, Box<RowInfo>)>) -> Table {
             props.width = info.width;
             props.width_pct = info.width_pct;
         }
-        props.fixed |= info.fixed;
+        props.fixed |= !info.autofit;
         let (cells, bounds) = build_row(cells, &info);
         let mut row = Row {
             props: RowProps { height: info.height, height_rule: info.height_rule, header: info.header, cant_split: info.cant_split, ..Default::default() },

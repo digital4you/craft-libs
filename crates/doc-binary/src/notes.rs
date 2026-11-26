@@ -68,12 +68,18 @@ pub(crate) enum Mark {
 /// walk. Hidden bookmarks (leading `_`) are kept: the engine can decide.
 pub(crate) fn parse_bookmarks(table: &[u8], fib: &crate::fib::Fib) -> Vec<(u32, Mark)> {
     let names = fib.pair(crate::fib::pair::STTBF_BKMK).and_then(|(fc, lcb)| sttb_strings(table, fc, lcb)).unwrap_or_default();
-    let starts = fib.pair(crate::fib::pair::PLCF_BKF).and_then(|(fc, lcb)| plc_of(table, fc, lcb, 4)).unwrap_or_default();
-    let ends = fib.pair(crate::fib::pair::PLCF_BKL).and_then(|(fc, lcb)| plc_of(table, fc, lcb, 2)).unwrap_or_default();
-    let n = starts.len().saturating_sub(1).min(ends.len().saturating_sub(1)).min(names.len()).min(MAX);
+    // PlcfBkf: a CP and an FBKF (ibkl, bkc) per bookmark. PlcfBkl holds CPs only ([MS-DOC]
+    // §2.8.12), in an order of its own: each FBKF's ibkl says which of them ends that bookmark,
+    // so nested or overlapping bookmarks (a table of contents' targets) pair up right.
+    let (starts, fbkf) = fib.pair(crate::fib::pair::PLCF_BKF).and_then(|(fc, lcb)| plc_with_data(table, fc, lcb, 4)).unwrap_or_default();
+    let ends = fib.pair(crate::fib::pair::PLCF_BKL).and_then(|(fc, lcb)| plc_with_data(table, fc, lcb, 0)).map(|(cps, _)| cps).unwrap_or_default();
+    let n = starts.len().saturating_sub(1).min(names.len()).min(MAX);
     let mut out = Vec::with_capacity(n * 2);
     for i in 0..n {
-        let (Some(&a), Some(&b)) = (starts.get(i), ends.get(i)) else { break };
+        let Some(&a) = starts.get(i) else { break };
+        let ibkl = fbkf.get(i * 4..i * 4 + 2).map(|x| usize::from(u16::from_le_bytes([x[0], x[1]])));
+        // The end PLC's last CP is its limit, no bookmark's end.
+        let Some(&b) = ibkl.filter(|k| *k + 1 < ends.len()).and_then(|k| ends.get(k)) else { continue };
         if b < a {
             continue;
         }
@@ -87,6 +93,20 @@ pub(crate) fn parse_bookmarks(table: &[u8], fib: &crate::fib::Fib) -> Vec<(u32, 
     }
     out.sort_by_key(|(cp, m)| (*cp, matches!(m, Mark::End(_))));
     out
+}
+
+/// The CPs of a PLC whose data elements are `data_size` bytes each (with the trailing limit
+/// CP), and the data elements' bytes.
+fn plc_with_data(table: &[u8], fc: u32, lcb: u32, data_size: usize) -> Option<(Vec<u32>, Vec<u8>)> {
+    let plc = table.get(fc as usize..(fc as usize).saturating_add(lcb as usize))?;
+    if plc.len() < 4 {
+        return None;
+    }
+    // n data elements and n + 1 CPs.
+    let n = ((plc.len() - 4) / (4 + data_size)).min(MAX);
+    let cps = (0..=n).filter_map(|i| plc.get(i * 4..i * 4 + 4)).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let data = plc.get((n + 1) * 4..(n + 1) * 4 + n * data_size).unwrap_or_default().to_vec();
+    Some((cps, data))
 }
 
 /// Strings of an STTB: extended (fExtend = 0xFFFF, 2-byte length and UTF-16 chars) or not
