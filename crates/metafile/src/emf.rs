@@ -76,15 +76,36 @@ pub(crate) fn parse(input: Bytes) -> Result<(Canvas, Option<Frame>), Error> {
     Ok((cv, frame))
 }
 
+/// The length of the header's own fields. The record size also counts the description string and
+/// the pixel format that follow them, so the fields end where either of those starts: a file whose
+/// description starts at 88 (Adobe Illustrator writes such files) has no header extension, and the
+/// bytes at 88 and 100 are text.
+fn header_fields_len(input: Bytes) -> usize {
+    let mut len = input.u32(4).map_or(0, |v| v as usize);
+    // nDescription and offDescription, then cbPixelFormat and offPixelFormat when they are fields.
+    for (count_at, off_at) in [(60, 64), (88, 92)] {
+        if len < off_at + 4 {
+            break;
+        }
+        if let (Some(count), Some(off)) = (input.u32(count_at), input.u32(off_at))
+            && count > 0
+            && (88..len).contains(&(off as usize))
+        {
+            len = off as usize;
+        }
+    }
+    len
+}
+
 /// Device pixels per millimetre on each axis, from `szlDevice` (72) and the device's size:
-/// `szlMicrometers` (100) when the header has that extension (a header of 108 bytes or more) and
-/// it is set, which is a thousand times finer, else `szlMillimeters` (80).
+/// `szlMicrometers` (100) when the header has that extension (header fields of 108 bytes or more)
+/// and it is set, which is a thousand times finer, else `szlMillimeters` (80).
 fn device_px_per_mm(input: Bytes) -> Option<(f64, f64)> {
     let (dw, dh) = (input.i32(72)?, input.i32(76)?);
     if dw <= 0 || dh <= 0 {
         return None;
     }
-    if input.u32(4)? >= 108
+    if header_fields_len(input) >= 108
         && let (Some(uw), Some(uh)) = (input.u32(100), input.u32(104))
         && uw > 0
         && uh > 0
