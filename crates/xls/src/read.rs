@@ -19,7 +19,7 @@ use crate::records::{Cursor, Record, Records};
 use crate::{Error, Limits, Read, Warning, biff5, cond, drawing, notes, styles};
 
 const MAX_STRINGS: usize = 4_000_000;
-const MAX_SHEETS: usize = 4096;
+pub(crate) const MAX_SHEETS: usize = 4096;
 const MAX_NAMES: usize = 65_536;
 const MAX_XFS: usize = 65_536;
 const MAX_MERGES: usize = 100_000;

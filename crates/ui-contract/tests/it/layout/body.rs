@@ -406,6 +406,47 @@ fn a_space_between_child_leaves_room_for_the_siblings_after_it() {
     assert!(first.width() >= WORD - SLACK, "the wrapping row asked for its one-line width as its least: {dump}");
 }
 
+/// The children of a wrapping `Row` stand on the line they wrap onto: one-line children sit at the middle of their
+/// line, a child of more than one line at its top, and each line is as tall as its tallest child, also in the frames
+/// that reuse the row's measurement. The row is sized from its content, so its real run is narrower than its
+/// measuring run's room.
+#[trial]
+fn a_wrapping_row_sets_its_children_on_the_middle_of_their_line() {
+    const SIZES: [Vec2; 5] = [ITEM, Vec2::new(40.0, 30.0), ITEM, Vec2::new(40.0, 40.0), ITEM];
+    let seen: Rc<[RefCell<Seen>; 7]> = Rc::new(Default::default());
+    let shown = Rc::clone(&seen);
+    let mut fixture = Fixture::new(move |ui| {
+        Panel::new().layout(BodyLayout::row().wrap(true)).id_salt("wrapping").show(ui, |ui, _| {
+            for (i, size) in SIZES.iter().take(3).enumerate() {
+                Probe::new(&shown[i]).size(*size).id_salt(i).show(ui);
+            }
+            // A column of two lines: it starts the second line.
+            Panel::new().layout(BodyLayout::Stack).id_salt("column").show(ui, |ui, _| {
+                Probe::new(&shown[5]).size(ITEM).id_salt("upper").show(ui);
+                Probe::new(&shown[6]).size(ITEM).id_salt("lower").show(ui);
+            });
+            for (i, size) in SIZES.iter().enumerate().skip(3) {
+                Probe::new(&shown[i]).size(*size).id_salt(i).show(ui);
+            }
+        });
+    });
+    fixture.room(Vec2::new(150.0, 400.0)).settle();
+    let rects = || seen.each_ref().map(|seen| seen.borrow().rect);
+    let settled = rects();
+    let [first, tall, third, taller, last, upper, lower] = settled;
+    let dump = format!("{settled:?}");
+    assert!(
+        (first.center().y - tall.center().y).abs() < SLACK && (third.center().y - tall.center().y).abs() < SLACK,
+        "the first line's one-line children share its middle: {dump}"
+    );
+    assert!(upper.min.x < tall.min.x && upper.top() >= tall.bottom() - SLACK, "the column wraps onto the second line: {dump}");
+    assert!((upper.top() - taller.top()).abs() < SLACK && lower.bottom() < taller.bottom(), "the column sits at the top of its line: {dump}");
+    assert!((last.center().y - taller.center().y).abs() < SLACK, "the second line's one-line children share its middle: {dump}");
+    assert!(upper.top() - tall.bottom() < ITEM.y, "the first line is as tall as its tallest child: {dump}");
+    fixture.idle(3);
+    assert_eq!(rects(), settled, "the frames that reuse the measurement set the children on the same lines");
+}
+
 /// A container whose body is the caller's closure and whose end region holds a probe that records into `end`.
 #[derive(Component)]
 #[component(container)]
@@ -521,5 +562,26 @@ fn a_scrolling_container_in_a_right_to_left_row_measures_and_shows_finite() {
         assert!(finite(row) && finite(panel) && finite(inside) && finite(beside), "every rect is finite: {dump}");
         assert!(panel.width() > 100.0 && panel.max.x <= region.max.x + SLACK, "the container shows in the row: {dump}");
         assert!(panel.min.x > beside.max.x - SLACK, "under RTL the container is right of the probe after it: {dump}");
+    }
+}
+
+/// A labelled container with a footer, shown in a rect narrower than its padding, in either direction: its measuring
+/// run places the footer under the control column of a line with no room, and the container shows.
+#[trial]
+fn a_labelled_container_narrower_than_its_padding_places_its_footer() {
+    use craft_ui::contract::{FooterRegion, Pad, SideLabel};
+    use craft_ui_test_kit::body::Slab;
+    for direction in [Direction::Ltr, Direction::Rtl] {
+        let (_, rects) = lay_out(Some(direction), |ui| {
+            let at = Rect::from_min_size(ui.available_rect_before_wrap().min, Vec2::new(4.0, 60.0));
+            let props = ContainerProps::new().label(SideLabel::new()).footer(FooterRegion::new()).pad(Pad::Regular).sizing(Sizing::FillWidth);
+            let narrow = ui.scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
+                Slab::new(props).label("Balance").id_salt("field").show(ui, |ui, _| {
+                    Block::new(ITEM).show(ui);
+                })
+            });
+            vec![narrow.inner.output.rect]
+        });
+        assert!(rects[0].min.is_finite() && rects[0].max.is_finite(), "{direction:?}: the container shows at {:?}", rects[0]);
     }
 }

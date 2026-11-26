@@ -30,7 +30,7 @@ pub(crate) fn is_emf(b: Bytes) -> bool {
 
 /// The picture frame: `rclFrame` (0.01 mm) mapped to device units through `szlDevice` and
 /// `szlMillimeters`, sized in points. Without a usable frame, the device bounds stand in (1 unit = 1 point).
-pub(crate) fn parse(input: Bytes) -> Result<(Canvas, Option<Frame>), Error> {
+pub(crate) fn parse(input: Bytes, depth: u8) -> Result<(Canvas, Option<Frame>), Error> {
     if !is_emf(input) {
         return Err(Error::BadHeader);
     }
@@ -45,7 +45,7 @@ pub(crate) fn parse(input: Bytes) -> Result<(Canvas, Option<Frame>), Error> {
     if let Some(px_mm) = device_px_per_mm(input) {
         cv.set_device_mm(px_mm);
     }
-    let mut plus = crate::emfplus::Plus::new();
+    let mut plus = crate::emfplus::Plus::new(depth);
     plus.frame = frame.as_ref().map(|f| f.rect);
     let mut parsed = 0usize;
     let mut pos = hsize.max(88);
@@ -76,44 +76,16 @@ pub(crate) fn parse(input: Bytes) -> Result<(Canvas, Option<Frame>), Error> {
     Ok((cv, frame))
 }
 
-/// The length of the header's own fields. The record size also counts the description string and
-/// the pixel format that follow them, so the fields end where either of those starts: a file whose
-/// description starts at 88 (Adobe Illustrator writes such files) has no header extension, and the
-/// bytes at 88 and 100 are text.
-fn header_fields_len(input: Bytes) -> usize {
-    let mut len = input.u32(4).map_or(0, |v| v as usize);
-    // nDescription and offDescription, then cbPixelFormat and offPixelFormat when they are fields.
-    for (count_at, off_at) in [(60, 64), (88, 92)] {
-        if len < off_at + 4 {
-            break;
-        }
-        if let (Some(count), Some(off)) = (input.u32(count_at), input.u32(off_at))
-            && count > 0
-            && (88..len).contains(&(off as usize))
-        {
-            len = off as usize;
-        }
-    }
-    len
-}
-
 /// Device pixels per millimetre on each axis, from `szlDevice` (72) and the device's size:
-/// `szlMicrometers` (100) when the header has that extension (header fields of 108 bytes or more)
-/// and it is set, which is a thousand times finer, else `szlMillimeters` (80).
+/// `szlMicrometers` (100) when the fixed header includes that extension and
+/// it is set, which is a thousand times finer, else `szlMillimeters` (80).
 fn device_px_per_mm(input: Bytes) -> Option<(f64, f64)> {
-    let (dw, dh) = (input.i32(72)?, input.i32(76)?);
-    if dw <= 0 || dh <= 0 {
-        return None;
-    }
-    if header_fields_len(input) >= 108
-        && let (Some(uw), Some(uh)) = (input.u32(100), input.u32(104))
-        && uw > 0
-        && uh > 0
-    {
-        return Some((f64::from(dw) * 1000.0 / f64::from(uw), f64::from(dh) * 1000.0 / f64::from(uh)));
-    }
-    let (mw, mh) = (input.i32(80)?, input.i32(84)?);
-    (mw > 0 && mh > 0).then(|| (f64::from(dw) / f64::from(mw), f64::from(dh) / f64::from(mh)))
+    let facts = crate::units::emf_device(input)?;
+    let (dw, dh) = (f64::from(facts.pixels.0), f64::from(facts.pixels.1));
+    Some(match facts.physical_size {
+        crate::EmfPhysicalSize::Micrometres(w, h) => (dw * 1000.0 / f64::from(w), dh * 1000.0 / f64::from(h)),
+        crate::EmfPhysicalSize::Millimetres(w, h) => (dw / f64::from(w), dh / f64::from(h)),
+    })
 }
 
 /// The frame from `rclFrame` (offset 24), `szlDevice` (72) and `szlMillimeters` (80) in the header.
