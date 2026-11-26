@@ -5453,9 +5453,9 @@ fn retained_drawingml_ole_uses_the_shared_stacking_map() {
         assert!(matches!(paras(&d)[0].objects[0], InlineObject::Image { ole: Some(_), .. }));
     }
     // A direct VML preview wins in read_object, even when DrawingML is retained beside it.
-    // Its signed z-index is not a modeled stacking rank. Preserve both representations rather
-    // than assigning a fresh DrawingML rank from the VML-derived model's unset z.
-    for signed in [-17, 17] {
+    // Its z-index gives the model's order as Word's `relativeHeight` (behind the text: less
+    // 0x1E000000), one more as for DrawingML. Both representations are preserved as written.
+    for (signed, model) in [(-17, 0x1E00_0000 - 17 + 1), (17, 18)] {
         let vml = format!(
             r#"<v:shape style="position:absolute;width:72pt;height:36pt;z-index:{signed}" odd="vml"><v:imagedata r:id="rId8"/></v:shape><w:drawing>"#
         );
@@ -5467,7 +5467,7 @@ fn retained_drawingml_ole_uses_the_shared_stacking_map() {
             &[("[Content_Types].xml", types), ("word/media/image1.png", picture), ("word/embeddings/oleObject1.bin", ole)],
         ))
         .unwrap();
-        assert_eq!(paras(&d)[0].objects[0].frame().unwrap().2.z, 0);
+        assert_eq!(paras(&d)[0].objects[0].frame().unwrap().2.z, model);
         for _ in 0..3 {
             let out = craft_docx::write(&d).unwrap();
             let files = unzip(&out);
@@ -5478,7 +5478,7 @@ fn retained_drawingml_ole_uses_the_shared_stacking_map() {
             assert_eq!(styles.len(), 1);
             assert!(styles[0].split(';').any(|p| p == format!("z-index:{signed}")));
             d = craft_docx::read(&out).unwrap();
-            assert_eq!(paras(&d)[0].objects[0].frame().unwrap().2.z, 0);
+            assert_eq!(paras(&d)[0].objects[0].frame().unwrap().2.z, model);
         }
     }
 }

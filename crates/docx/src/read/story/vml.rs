@@ -48,7 +48,7 @@ impl Reader<'_> {
         let style = grp.attr("style").unwrap_or("");
         let len = |k: &str| vml_style(style, k).and_then(|v| measure(v, 1.0)).unwrap_or(0.0).clamp(0.0, crate::units::MAX_LEN_PT);
         let (w, h) = (len("width"), len("height"));
-        let float = vml_float(grp, style, sc.in_hf);
+        let float = vml_float(grp, style, sc.in_hf, self.file_orders);
         // The members' space; without a usable `coordsize` it is the group's own box.
         let (ch_w, ch_h) = vml_coordpair(grp, "coordsize").filter(|(cw, ch)| *cw > 0.0 && *ch > 0.0).unwrap_or((w.max(1.0), h.max(1.0)));
         let (cx, cy) = vml_coordpair(grp, "coordorigin").unwrap_or((0.0, 0.0));
@@ -128,7 +128,7 @@ impl Reader<'_> {
                 f.set_spin(vml_spin(style));
                 f
             }
-            None => vml_float(shape, style, sc.in_hf),
+            None => vml_float(shape, style, sc.in_hf, self.file_orders),
         };
         if let Some(img) = shape.find("v:imagedata") {
             let Some(id) = img.attr("r:id").or_else(|| img.attr("r:pict")) else {
@@ -555,8 +555,8 @@ fn css_string(v: &str) -> String {
 /// `mso-position-horizontal-relative` / `mso-position-vertical-relative` (unless aligned with
 /// `mso-position-horizontal` / `mso-position-vertical`), wrapped as its `w10:wrap` says. Without
 /// wrapping (`none`, or no `w10:wrap`) it's in front of the text, or behind it at a negative
-/// `z-index`. Anything else stays inline.
-fn vml_float(shape: &El, style: &str, in_hf: bool) -> Float {
+/// `z-index`, which also gives its stacking order (see [`vml_order`]). Anything else stays inline.
+fn vml_float(shape: &El, style: &str, in_hf: bool, orders: craft_wordmodel::para::FileOrders) -> Float {
     let get = |k: &str| vml_style(style, k);
     let hidden = get("visibility").is_some_and(|v| v.eq_ignore_ascii_case("hidden"));
     if !get("position").is_some_and(|p| p.eq_ignore_ascii_case("absolute")) {
@@ -567,7 +567,8 @@ fn vml_float(shape: &El, style: &str, in_hf: bool) -> Float {
     }
     let off = |k: &str| get(k).and_then(|v| measure(v, 1.0)).unwrap_or(0.0);
     let max = crate::units::MAX_LEN_PT;
-    let behind = get("z-index").and_then(int).is_some_and(|z| z < 0);
+    let z_index = get("z-index").and_then(int);
+    let behind = z_index.is_some_and(|z| z < 0);
     let wrap_el = shape.child("w10:wrap");
     let wrap_type = wrap_el.and_then(|w| w.attr("type")).unwrap_or("none");
     let wrap = match wrap_type {
@@ -615,6 +616,7 @@ fn vml_float(shape: &El, style: &str, in_hf: bool) -> Float {
         dist_top: dist("mso-wrap-distance-top"),
         dist_bottom: dist("mso-wrap-distance-bottom"),
         hidden,
+        z: orders.model_order(z_index.map(vml_order)),
         // Word for Mac draws a VML shape anchored in a header table cell on the page whatever
         // `o:allowincell` says (user-checked), as for Word's picture and text watermarks. In the
         // body, Layout in table cell off (`o:allowincell="f"`) places the shape outside its cell,
@@ -625,6 +627,19 @@ fn vml_float(shape: &El, style: &str, in_hf: bool) -> Float {
     };
     f.set_spin(vml_spin(style));
     f
+}
+
+/// How far below its `relativeHeight` Word writes the `z-index` of an object behind the text in
+/// its VML fallback (an object in front of the text keeps the same number).
+const VML_BEHIND_Z: i64 = 0x1E00_0000;
+
+/// The `relativeHeight` a VML `z-index` stands for, so VML shapes stack among each other and
+/// among DrawingML objects as Word stacks them (a higher one over a lower one): Word writes an
+/// object behind the text as its `relativeHeight` less [`VML_BEHIND_Z`]. An order below that
+/// range stacks lowest.
+fn vml_order(z: i64) -> u32 {
+    let order = if z < 0 { z + VML_BEHIND_Z } else { z };
+    u32::try_from(order.max(0)).unwrap_or(u32::MAX)
 }
 
 /// Word's text watermark (Design › Watermark): a VML shape in a header whose `v:textpath` draws

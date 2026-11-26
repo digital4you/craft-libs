@@ -343,8 +343,8 @@ impl super::Writer<'_> {
     /// written by the caller). `None` when it can't be written back (its parts are gone).
     pub(super) fn embedded_xml(&mut self, src: &Embedded, rels: &mut PartRels, resize: Option<(f32, f32, &Float, &str)>) -> Option<String> {
         let mut root = self.embedded_tree(src, rels, resize)?;
-        // read_object prefers a direct VML preview. Its signed z-index is not modeled, so a
-        // coexisting retained DrawingML frame cannot safely be assigned the model's order.
+        // read_object prefers a direct VML preview, whose z-index is kept as written, so a
+        // coexisting retained DrawingML frame keeps its own order too rather than the model's.
         let vml_preview = root.els().any(|e| e.name.starts_with("v:") && e.local() != "shapetype");
         if let Some((_, _, float, _)) = resize
             && !vml_preview
@@ -491,7 +491,7 @@ impl super::Writer<'_> {
     /// shape and DrawingML picture, with the effect extent covering the rotated bounds as for
     /// other drawings, its alt text into both, and give its drawing a fresh `wp:docPr` id.
     /// Retained DrawingML frames of one OLE object share one allocated order.
-    /// This does not normalize VML z-index: its signed order is not represented by the reader.
+    /// A VML z-index is left as written.
     /// Stop at each outer anchor or inline frame: nested drawings have their own placement.
     fn retained_anchor_order(&mut self, e: &mut El, float: &Float, order: &mut Option<u32>, depth: usize) {
         if depth > MAX_DEPTH {
