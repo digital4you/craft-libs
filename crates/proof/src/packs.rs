@@ -28,6 +28,8 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::lang::ProofLang;
 use crate::patterns::Patterns;
 
+pub use crate::pack_lang::install_spelling_pack;
+
 /// The base name of a pack's Hunspell pair (`spelling.aff`, `spelling.dic`).
 pub(crate) const SPELLING: &str = "spelling";
 /// A pack's hyphenation patterns.
@@ -168,6 +170,7 @@ pub fn licence_texts() -> Vec<(String, String)> {
     }
     out.push(("English word supplement (en-extra.txt)".into(), EXTRA_EN_NOTICE.into()));
     out.extend(crate::data::EMBEDDED_LICENCES.iter().map(|(t, x)| ((*t).to_string(), (*x).to_string())));
+    out.extend(crate::pack_lang::hosted_notice());
     // Each file is checked against what is left before it is read, so no more is ever read.
     let mut left: u64 = MAX_LICENCE_TOTAL;
     for (p, _) in &scan().packs {

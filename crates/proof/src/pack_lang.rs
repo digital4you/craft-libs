@@ -49,7 +49,16 @@ struct Loaded {
     used: u64,
 }
 
+/// One file-less pack supplied by a browser host, kept for this editor session.
+struct HostedPack {
+    locale: PackLocale,
+    dict: Arc<AffixDict>,
+    scripts: Arc<[u32]>,
+    notice: String,
+}
+
 struct Cache {
+    hosted: Option<HostedPack>,
     loaded: Vec<Loaded>,
     /// Locales with no dictionary (or one that failed to load).
     missing: Vec<PackLocale>,
@@ -58,7 +67,30 @@ struct Cache {
     reloads: u64,
 }
 
-static CACHE: RwLock<Cache> = RwLock::new(Cache { loaded: Vec::new(), missing: Vec::new(), clock: 0, reloads: 0 });
+static CACHE: RwLock<Cache> = RwLock::new(Cache { hosted: None, loaded: Vec::new(), missing: Vec::new(), clock: 0, reloads: 0 });
+
+/// Install or replace a host's spelling pack atomically. The bytes stay external to the
+/// binary and retain their Hunspell encoding. An invalid replacement leaves the old pack in use.
+pub fn install_spelling_pack(tag: &str, aff: &[u8], dic: &[u8], notice: String) -> Result<(), String> {
+    let locale = crate::ProofLang::from_tag(Some(tag)).spelling_locale().ok_or("not a pack-backed spelling language")?;
+    if aff.len() > 1 << 20 || dic.len() > 16 << 20 || notice.len() > 1 << 20 || notice.trim().is_empty() {
+        return Err("invalid spelling pack size or missing licence notice".into());
+    }
+    let (aff, dic) = crate::hunspell::decode(aff, dic)?;
+    let dict = AffixDict::from_hunspell(&aff, &dic, &[])?;
+    if dict.is_empty() {
+        return Err("empty spelling dictionary".into());
+    }
+    let hosted = HostedPack { locale, scripts: scripts(&dict), dict: Arc::new(dict), notice };
+    CACHE.write().unwrap_or_else(PoisonError::into_inner).hosted = Some(hosted);
+    crate::DICTIONARY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+pub(crate) fn hosted_notice() -> Option<(String, String)> {
+    let cache = CACHE.read().unwrap_or_else(PoisonError::into_inner);
+    cache.hosted.as_ref().map(|p| (p.locale.as_str().to_owned(), p.notice.clone()))
+}
 
 /// Forget every loaded dictionary (the dictionaries folder or the packs changed).
 pub(crate) fn reload() {
@@ -254,6 +286,9 @@ fn get_with_scripts(locale: PackLocale) -> (Arc<AffixDict>, Option<PathBuf>, Arc
     let reloads = {
         let mut c = CACHE.write().unwrap_or_else(PoisonError::into_inner);
         c.clock = c.clock.wrapping_add(1);
+        if let Some(pack) = c.hosted.as_ref().filter(|p| p.locale == locale) {
+            return (pack.dict.clone(), None, pack.scripts.clone());
+        }
         let now = c.clock;
         if let Some(l) = c.loaded.iter_mut().find(|l| l.locale == locale) {
             l.used = now;
