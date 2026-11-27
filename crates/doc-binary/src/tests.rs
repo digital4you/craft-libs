@@ -2829,6 +2829,8 @@ fn a_long_hyperlink_over_a_long_result_is_one_linked_run() {
         instr: format!("HYPERLINK \"http://{target}\""),
         sep: Some(result),
         anchor: craft_wordmodel::props::CharProps::default(),
+        base: None,
+        after_comma: false,
     };
     let work = super::Work::new(u64::MAX);
     super::finish_field(&mut super::ParaBuild::default(), f, &work);
@@ -2848,6 +2850,8 @@ fn hyperlink_target_copies_are_charged_to_the_work_budget() {
         instr: format!("HYPERLINK \"{}\"", "u".repeat(100)),
         sep: Some(result),
         anchor: craft_wordmodel::props::CharProps::default(),
+        base: None,
+        after_comma: false,
     };
     let mut pb = super::ParaBuild::default();
     let budget = super::Work::new(10_000);
@@ -2984,7 +2988,7 @@ fn field_results_keep_their_text_and_runs() {
     {
         result.push(c, p);
     }
-    let f = super::FieldBuild { depth: 1, instr: "HYPERLINK \"http://x\"".into(), sep: Some(result), anchor: CharProps::default() };
+    let f = super::FieldBuild { depth: 1, instr: "HYPERLINK \"http://x\"".into(), sep: Some(result), anchor: CharProps::default(), base: None, after_comma: false };
     let mut pb = super::ParaBuild::default();
     super::finish_field(&mut pb, f, &super::Work::new(u64::MAX));
     assert_eq!(pb.text, "a\u{e9}\u{20ac}bc");

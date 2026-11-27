@@ -383,13 +383,15 @@ pub(crate) fn workbook(
                     2 => Visibility::VeryHidden,
                     _ => return Err(invalid("invalid sheet visibility")),
                 };
-                let sheet_id = b.u32()?;
-                if !(1..=65535).contains(&sheet_id) {
-                    return Err(invalid("invalid worksheet ID"));
-                }
-                let rel_id = b.string(255, true)?;
-                let name = b.text(31)?;
-                b.finish()?;
+                // Excel 2007 writes four more bytes before the sheet ID.
+                let (sheet_id, rel_id, name) = match bundle_sheet(Bytes::new(b.rest)) {
+                    Ok(sheet) => sheet,
+                    Err(err) => {
+                        let mut longer = Bytes::new(b.rest);
+                        longer.u32()?;
+                        bundle_sheet(longer).map_err(|_| err)?
+                    }
+                };
                 let Some(rel_id) = rel_id else {
                     if visibility != Visibility::VeryHidden {
                         return Err(invalid("worksheet relationship is null"));
@@ -688,6 +690,18 @@ fn link_record(id: u16, payload: &[u8], links: &mut Links, pending: &mut Vec<Pen
     Ok(())
 }
 
+/// The rest of a BrtBundleSh after its visibility: sheet ID, relationship ID and name.
+fn bundle_sheet(mut b: Bytes<'_>) -> Result<(u32, Option<String>, String), Error> {
+    let sheet_id = b.u32()?;
+    if !(1..=65535).contains(&sheet_id) {
+        return Err(invalid("invalid worksheet ID"));
+    }
+    let rel_id = b.string(255, true)?;
+    let name = b.text(31)?;
+    b.finish()?;
+    Ok((sheet_id, rel_id, name))
+}
+
 /// A `RichStr`: the text; formatting and phonetic runs are skipped.
 fn rich_string(b: &mut Bytes<'_>) -> Result<String, Error> {
     let flags = b.u8()?;
@@ -705,8 +719,9 @@ fn rich_string(b: &mut Bytes<'_>) -> Result<String, Error> {
         if count > 32767 {
             return Err(invalid("too many phonetic runs"));
         }
-        b.take(count as usize * 10)?;
-        // Writers pad the phonetic data; nothing after it is read.
+        // Excel writes six bytes per run (ichFirst, ichMom, cchMom) and then the
+        // phonetic properties, not the 12-byte PhRun of MS-XLSB; nothing after the
+        // phonetic text is read, so the rest of the record is skipped.
         b.rest = &[];
     }
     Ok(text)

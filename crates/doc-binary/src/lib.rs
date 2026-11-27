@@ -30,6 +30,7 @@ mod notes;
 mod officeart;
 mod piece;
 mod rmark;
+mod ruby;
 mod recover;
 mod sections;
 mod sprm;
@@ -959,13 +960,13 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                         if let Some(f) = field.take() {
                             ranges.push(open_range(&mut pb, f, ctx.work));
                         }
-                        field = Some(FieldBuild { depth: 1, instr: String::new(), sep: None, anchor: anchor_props(ctx, cp) });
+                        field = Some(FieldBuild { depth: 1, instr: String::new(), sep: None, anchor: anchor_props(ctx, cp), base: None, after_comma: false });
                     }
                     // A field inside another's instruction is part of that instruction.
                     Some(f) => {
                         f.depth = f.depth.saturating_add(1);
                     }
-                    None => field = Some(FieldBuild { depth: 1, instr: String::new(), sep: None, anchor: anchor_props(ctx, cp) }),
+                    None => field = Some(FieldBuild { depth: 1, instr: String::new(), sep: None, anchor: anchor_props(ctx, cp), base: None, after_comma: false }),
                 }
                 cp = cp.saturating_add(1);
                 continue;
@@ -1109,6 +1110,10 @@ struct FieldBuild {
     sep: Option<FieldResult>,
     /// The begin character's revision marks, for the field object's anchor.
     anchor: CharProps,
+    /// The formatting of the instruction after its last comma: an EQ ruby field's base text.
+    base: Option<CharProps>,
+    /// The last instruction character was a comma.
+    after_comma: bool,
 }
 
 /// A field's cached result: its text and, as runs, the formatting of that text. A run is added
@@ -1180,6 +1185,16 @@ fn finish_field(pb: &mut ParaBuild, f: FieldBuild, work: &Work) {
             }
         }
         return;
+    }
+    // Word keeps no result for a Phonetic Guide's EQ field; it is read as the ruby it shows.
+    if result.text.is_empty() {
+        let mut base = f.base.clone().unwrap_or_default();
+        if let Some(obj) = ruby::from_field(&instr, &base) {
+            (base.ins, base.del) = (f.anchor.ins, f.anchor.del);
+            pb.push('\u{FFFC}', base);
+            pb.objects.push(obj);
+            return;
+        }
     }
     // A result whose tracked insertions or deletions are not the field's own (an updated page
     // number keeps the old one as deleted text) is written as a range field, so each run keeps
@@ -1344,7 +1359,16 @@ fn push_formatted<'a>(pb: &mut ParaBuild, cp: u32, c: char, ctx: &WalkCtx<'a>, f
             // Inside a field, characters are recorded for the field object instead of shown;
             // `finish_field` emits the visible text (hyperlink runs or one object anchor).
             Some(result) => result.push(c, props),
-            None => f.instr.push(c),
+            None => {
+                if f.after_comma && !c.is_whitespace() {
+                    f.base = Some(props);
+                    f.after_comma = false;
+                }
+                if c == ',' && !f.instr.ends_with('\\') {
+                    f.after_comma = true;
+                }
+                f.instr.push(c);
+            }
         },
         None => pb.push(c, props),
     }
